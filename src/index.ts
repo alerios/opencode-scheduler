@@ -579,7 +579,7 @@ function formatSystemdValue(value: number, size: number): string {
   return value.toString().padStart(size, "0")
 }
 
-function cronToSystemdCalendars(cron: string): string[] {
+export function cronToSystemdCalendars(cron: string): string[] {
   const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron)
   const minuteValues = parseCronField(minute, 0, 59, "minute")
   const hourValues = parseCronField(hour, 0, 23, "hour")
@@ -603,7 +603,8 @@ function cronToSystemdCalendars(cron: string): string[] {
         for (const domValue of domValues) {
           for (const monthValue of months) {
             for (const dowValue of dowValues) {
-              calendars.push(`${dowValue} *-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`)
+              const dowPrefix = dowValue === "*" ? "" : `${dowValue} `
+              calendars.push(`${dowPrefix}*-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`)
             }
           }
         }
