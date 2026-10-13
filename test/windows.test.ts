@@ -9,6 +9,8 @@ import {
   splitWindowsTaskName,
   summarizeExecError,
   windowsSystemBinaries,
+  windowsTaskNames,
+  windowsTaskNamesToDelete,
   windowsTaskRunValue,
 } from "../src/windows"
 import { WINDOWS_SUPERVISOR_SCRIPT } from "../src/supervisor-windows"
@@ -204,6 +206,33 @@ describe("cronToWindowsTaskDefinitions", () => {
   })
 })
 
+describe("task names: creation and uninstall share one helper", () => {
+  test("1, 2 and 3 triggers; uninstall list is a superset and includes legacy names", () => {
+    expect(windowsTaskNames("\\OpenCode", "opencode-job-s-x", 1)).toEqual(["\\OpenCode\\opencode-job-s-x"])
+    expect(windowsTaskNames("\\OpenCode", "opencode-job-s-x", 2)).toEqual(["\\OpenCode\\opencode-job-s-x-1", "\\OpenCode\\opencode-job-s-x-2"])
+    expect(windowsTaskNames("\\OpenCode", "opencode-job-s-x", 3)).toEqual([
+      "\\OpenCode\\opencode-job-s-x-1",
+      "\\OpenCode\\opencode-job-s-x-2",
+      "\\OpenCode\\opencode-job-s-x-3",
+    ])
+    const toDelete = new Set(windowsTaskNamesToDelete("\\OpenCode", ["opencode-job-s-x", "opencode-job-x"]))
+    for (const total of [1, 2, 3, 64]) {
+      for (const name of windowsTaskNames("\\OpenCode", "opencode-job-s-x", total)) expect(toDelete.has(name)).toBe(true)
+      for (const name of windowsTaskNames("\\OpenCode", "opencode-job-x", total)) expect(toDelete.has(name)).toBe(true)
+    }
+    // Names created by older versions: unsuffixed first task, then -2..-64.
+    for (const legacy of ["\\OpenCode\\opencode-job-s-x", "\\OpenCode\\opencode-job-s-x-2", "\\OpenCode\\opencode-job-s-x-64", "\\OpenCode\\opencode-job-x-5"]) {
+      expect(toDelete.has(legacy)).toBe(true)
+    }
+  })
+
+  test("cronToWindowsTaskDefinitions names come from windowsTaskNames", () => {
+    const job = { scopeId: "s", slug: "x", name: "x", schedule: "0 8,12,18 * * *", createdAt: "2026-10-12T00:00:00.000Z" }
+    const defs = index.__testing.windowsTaskDefinitions(job, "TR")
+    expect(defs.map((d) => d.name)).toEqual(windowsTaskNames("\\OpenCode", "opencode-job-s-x", 3))
+  })
+})
+
 describe("supervisor.ps1 template", () => {
   test("pure ASCII (PowerShell 5.1 reads BOM-less .ps1 as ANSI)", () => {
     expect(/^[\x09\x0a\x0d\x20-\x7e]*$/.test(WINDOWS_SUPERVISOR_SCRIPT)).toBe(true)
@@ -271,5 +300,16 @@ describe("supervisor.ps1 template", () => {
     expect(body).not.toContain("Get-IsoNow")
     expect(body).toContain("try {")
     expect(body).toContain("exit 1")
+  })
+
+  test("log writes open, append and close per write (no shared stream position across runs)", () => {
+    expect(WINDOWS_SUPERVISOR_SCRIPT).not.toContain("System.IO.StreamWriter")
+    expect(WINDOWS_SUPERVISOR_SCRIPT).not.toMatch(/\$log\b/)
+    const writeLog = WINDOWS_SUPERVISOR_SCRIPT.slice(WINDOWS_SUPERVISOR_SCRIPT.indexOf("function Write-Log"))
+    const body = writeLog.slice(0, writeLog.indexOf("\n}\n"))
+    expect(body).toContain("[System.IO.FileMode]::Append")
+    expect(body).toContain("[System.IO.FileShare]::ReadWrite")
+    expect(body).toContain("Dispose()")
+    expect(body).toContain("$Utf8.GetBytes($Text)")
   })
 })

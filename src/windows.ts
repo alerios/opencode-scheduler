@@ -133,6 +133,26 @@ export function windowsTaskRunValue(action: WindowsSupervisorAction): string {
   return action.commandLine.length <= WINDOWS_TR_MAX ? action.commandLine : action.execute
 }
 
+/** Task names for a job with `total` triggers: unsuffixed for one task, -1..-N for several. Used by create and uninstall. */
+export function windowsTaskNames(root: string, baseName: string, total: number): string[] {
+  if (total <= 1) return [`${root}\\${baseName}`]
+  return Array.from({ length: total }, (_, index) => `${root}\\${baseName}-${index + 1}`)
+}
+
+/**
+ * Every name windowsTaskNames can produce for up to `max` triggers, for each base. This also
+ * covers older versions, which named tasks unsuffixed, then -2..-N.
+ */
+export function windowsTaskNamesToDelete(root: string, baseNames: string[], max = 64): string[] {
+  const names = new Set<string>()
+  for (const baseName of baseNames) {
+    for (let total = 1; total <= max; total += 1) {
+      for (const name of windowsTaskNames(root, baseName, total)) names.add(name)
+    }
+  }
+  return [...names]
+}
+
 export function splitWindowsTaskName(fullName: string): { path: string; name: string } {
   const index = fullName.lastIndexOf("\\")
   return { path: fullName.slice(0, index + 1) || "\\", name: fullName.slice(index + 1) }
