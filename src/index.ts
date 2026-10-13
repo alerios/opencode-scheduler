@@ -11,8 +11,7 @@
  * - Working directory support for MCP configs
  * - Environment variable injection (PATH for node/npx)
  */
-import type { Plugin } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin"
+import { tool, type ToolSpec } from "./v2-tool"
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
@@ -123,8 +122,15 @@ function scopedLogPath(scopeId: string, slug: string): string {
   return join(scopeLogsDir(scopeId), `${slug}.log`)
 }
 
+let defaultWorkdir = process.cwd()
+
+/** v2 plugins run inside the OpenCode service; its cwd is not the project. setup() sets this from ctx.location. */
+export function setDefaultWorkdir(dir: string): void {
+  defaultWorkdir = dir
+}
+
 function currentScopeId(): string {
-  return deriveScopeId(process.cwd())
+  return deriveScopeId(defaultWorkdir)
 }
 
 
@@ -223,7 +229,7 @@ interface BuiltinSkill {
 const SCHEDULED_JOB_BEST_PRACTICES_SKILL: BuiltinSkill = {
   name: "scheduled-job-best-practices",
   description: "Patterns for resilient, non-interactive scheduled opencode jobs",
-  suggestedPath: ".opencode/skill/scheduled-job-best-practices/SKILL.md",
+  suggestedPath: ".opencode/skills/scheduled-job-best-practices/SKILL.md",
   files: {
     "SKILL.md": `---
 name: scheduled-job-best-practices
@@ -2251,9 +2257,17 @@ function getJobLogs(job: Job, options?: { tailLines?: number; maxChars?: number 
 
 // === PLUGIN ===
 
-export const SchedulerPlugin: Plugin = async () => {
+export function builtinSkillsForRegistration(): { id: string; name: string; description: string; content: string }[] {
+  return listBuiltinSkills().map((skill) => ({
+    id: skill.name,
+    name: skill.name,
+    description: skill.description,
+    content: skill.files["SKILL.md"] ?? "",
+  }))
+}
+
+export function buildTools(): Record<string, ToolSpec> {
   return {
-    tool: {
        schedule_job: tool({
            description:
             "Schedule a recurring job to run an opencode prompt. Uses launchd (Mac), systemd (Linux), Windows Task Scheduler, or cron fallback when needed.",
@@ -2309,7 +2323,7 @@ export const SchedulerPlugin: Plugin = async () => {
             const format = normalizeFormat(args.format)
             const slug = args.source ? `${args.source}-${slugify(args.name)}` : slugify(args.name)
 
-            const workdir = normalizeWorkdirPath(args.workdir || process.cwd())
+            const workdir = normalizeWorkdirPath(args.workdir || defaultWorkdir)
             const scopeId = deriveScopeId(workdir)
 
             if (loadScopedJob(scopeId, slug)) {
@@ -2470,7 +2484,7 @@ Commands:
 
           const scopeId = args.allScopes
             ? undefined
-            : deriveScopeId(normalizeWorkdirPath(args.scopeRoot || process.cwd()))
+            : deriveScopeId(normalizeWorkdirPath(args.scopeRoot || defaultWorkdir))
 
           let jobs = args.allScopes ? loadAllJobsAcrossScopes() : loadAllScopedJobs(scopeId!)
 
@@ -2581,7 +2595,7 @@ Commands:
       }),
 
       install_skill: tool({
-        description: "Install a built-in skill into your repo's .opencode/skill directory.",
+        description: "Install a built-in skill into your repo's .opencode/skills directory.",
         args: {
           name: tool.schema
             .string()
@@ -2607,7 +2621,7 @@ Commands:
             return errorResult(format, `No built-in skill found for ${label}. Available: ${available || "(none)"}`)
           }
 
-          const directory = args.directory ?? process.cwd()
+          const directory = args.directory ?? defaultWorkdir
           const overwrite = args.overwrite === true
 
           try {
@@ -3092,9 +3106,5 @@ Commands:
           return okResult(format, `Logs for ${job.name}\n\n${logs}`, { job, logPath, logs })
         },
       }),
-    },
   }
 }
-
-// Default export for OpenCode plugin system
-export default SchedulerPlugin
