@@ -3,7 +3,6 @@ import { mkdtempSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
 
-const home = mkdtempSync(join(tmpdir(), "sched-plugin-home-"))
 const project = mkdtempSync(join(tmpdir(), "sched-plugin-project-"))
 
 type Captured = { tools: any[]; skills: any[]; commands: any[]; prompts: any[] }
@@ -22,16 +21,16 @@ function fakeContext() {
 
 let plugin: any
 beforeAll(async () => {
-  process.env.HOME = home // module constants read homedir() at import time
   // Fail fast, before importing the plugin (which computes config paths from
   // homedir() at module load), if the HOME-isolation preload didn't take
-  // effect — otherwise a silently-broken preload would let src/index.ts's
-  // module-level homedir() calls resolve to the real ~/.config/opencode and
-  // write into it before the explicit isolation test below ever runs.
+  // effect — otherwise src/index.ts's module-level homedir() calls would
+  // resolve to the real ~/.config/opencode and write into it.
+  // Bun caches os.homedir() after its first call, so another test file may already
+  // have fixed it to the preload's temp HOME; require that, not a per-file HOME.
   const { homedir } = await import("os")
-  if (homedir() !== home) {
+  if (!homedir().startsWith(tmpdir()) || !homedir().includes("sched-")) {
     throw new Error(
-      `HOME isolation preload did not take effect: homedir() is "${homedir()}", expected "${home}". ` +
+      `HOME isolation preload did not take effect: homedir() is "${homedir()}". ` +
         `Refusing to import the plugin to avoid writing into the real home directory.`,
     )
   }
@@ -42,7 +41,8 @@ beforeAll(async () => {
 describe("v2 plugin entry", () => {
   test("test HOME is isolated (never touch the real ~/.config/opencode)", async () => {
     const { homedir } = await import("os")
-    expect(homedir()).toBe(home)
+    expect(homedir().startsWith(tmpdir())).toBe(true)
+    expect(homedir()).toContain("sched-")
   })
 
   test("default export is a v2 definition", () => {
@@ -74,6 +74,10 @@ describe("v2 plugin entry", () => {
   test("registers the best-practices skill and the /jobs command", async () => {
     expect(captured.skills.map((s) => String(s.id))).toEqual(["scheduled-job-best-practices"])
     expect(captured.skills[0].content).toContain("scheduled")
+    // Review Focus 4: unattended runs reject permission requests unless autoApprove (--auto).
+    expect(captured.skills[0].content).toContain("autoApprove")
+    expect(captured.skills[0].content).toContain("--auto")
+    expect(captured.skills[0].content).toContain("standalone")
     expect(captured.commands.map((c) => c.name)).toEqual(["jobs"])
     await captured.commands[0].execute({ sessionID: "ses_1", prompt: { text: "" }, delivery: "queue" })
     expect(captured.prompts[0].sessionID).toBe("ses_1")

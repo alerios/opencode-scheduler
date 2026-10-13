@@ -122,21 +122,15 @@ function scopedLogPath(scopeId: string, slug: string): string {
   return join(scopeLogsDir(scopeId), `${slug}.log`)
 }
 
-let defaultWorkdir = process.cwd()
-
-/** v2 plugins run inside the OpenCode service; its cwd is not the project. setup() sets this from ctx.location. */
-export function setDefaultWorkdir(dir: string): void {
-  defaultWorkdir = dir
-}
-
-function currentScopeId(): string {
-  return deriveScopeId(defaultWorkdir)
-}
-
-
-function ensureSupervisorScript(): void {
+export function ensureSupervisorScript(): void {
   ensureDir(SCHEDULER_DIR)
   writeFileSync(SUPERVISOR_PATH, SUPERVISOR_SCRIPT)
+}
+
+/** Test-only view of storage paths (computed from homedir() at module load). */
+export const __testing = {
+  paths: () => ({ scopesDir: SCOPES_DIR, legacyJobsDir: LEGACY_JOBS_DIR, supervisorPath: SUPERVISOR_PATH }),
+  deriveScopeId: (workdir: string) => deriveScopeId(workdir),
 }
 
 // Job type
@@ -251,6 +245,12 @@ Then write your task below it.
 3. **Idempotent.** Make reruns safe (maintain a seen/state file; avoid duplicate messages).
 4. **Observable.** Print a short summary at the end with status + outputs.
 5. **Minimal side effects.** Write durable artifacts under outputs/ in the job workdir.
+
+## Permissions In Unattended Runs (OpenCode v2)
+
+Nobody is watching a scheduled run, so OpenCode v2 **rejects every permission request** (file edits, bash, web fetch, ...) unless the job was scheduled with \`autoApprove: true\` (maps to \`opencode run --auto\`). A job that needs a tool which asks for permission will fail or stop early without it. Only set it for prompts you trust to run unsupervised.
+
+By default a run uses the shared OpenCode background service. Set \`standalone: true\` (maps to \`--standalone\`) to give each run its own private server instead, e.g. when the background service is not running at schedule time. \`attachUrl\` (maps to \`--server\`) targets a specific running server and takes precedence over \`standalone\`.
 
 ## Runtime Values: Dates
 
@@ -1677,7 +1677,12 @@ function normalizeRunSpec(run: JobRunSpec): JobRunSpec {
   return normalized
 }
 
-function validateRunSpec(run: JobRunSpec): void {
+/**
+ * `v2: false` skips the OpenCode v2 flag check. Use it only when LOADING saved jobs, so
+ * v1 jobs (port/share/command/variant-without-model) stay visible to list/get/migrate.
+ * Anything that BUILDS a new run spec or invocation must keep the default (`v2: true`).
+ */
+function validateRunSpec(run: JobRunSpec, options: { v2?: boolean } = {}): void {
   const hasPrompt = typeof run.prompt === "string" && run.prompt.trim().length > 0
   const hasCommand = typeof run.command === "string" && run.command.trim().length > 0
 
@@ -1707,7 +1712,7 @@ function validateRunSpec(run: JobRunSpec): void {
     throw new Error("run.runFormat must be 'default' or 'json'")
   }
 
-  const v2Issues = unsupportedV2Fields(run)
+  const v2Issues = options.v2 === false ? [] : unsupportedV2Fields(run)
   if (v2Issues.length) {
     throw new Error(v2Issues.join("; "))
   }
@@ -1774,7 +1779,8 @@ function sanitizeJob(job: Job): Job {
 
   if (sanitized.run) {
     const normalized = normalizeRunSpec(sanitized.run)
-    validateRunSpec(normalized)
+    // Saved jobs may still carry v1-only fields; migrate_jobs classifies them.
+    validateRunSpec(normalized, { v2: false })
     sanitized.run = normalized
   }
 
@@ -1878,9 +1884,9 @@ function normalizeJob(raw: unknown): Job | null {
 
 function findJobByName(
   name: string,
-  options?: { scopeId?: string; allScopes?: boolean; includeLegacy?: boolean }
+  scopeId: string,
+  options?: { allScopes?: boolean; includeLegacy?: boolean }
 ): Job | null {
-  const scopeId = options?.scopeId ?? currentScopeId()
   const slug = slugify(name)
 
   let job = loadScopedJob(scopeId, slug) || loadScopedJob(scopeId, name)
@@ -2267,7 +2273,13 @@ export function builtinSkillsForRegistration(): { id: string; name: string; desc
   }))
 }
 
-export function buildTools(): Record<string, ToolSpec> {
+/**
+ * `workdir` is the project this plugin instance serves (v2: ctx.location.directory). It is
+ * captured per call so several project instances in one OpenCode process never share it.
+ */
+export function buildTools(workdir: string): Record<string, ToolSpec> {
+  const defaultWorkdir = workdir
+  const currentScopeId = deriveScopeId(defaultWorkdir)
   return {
        schedule_job: tool({
            description:
@@ -2656,7 +2668,7 @@ Commands:
         },
         async execute(args) {
           const format = normalizeFormat(args.format)
-          const job = findJobByName(args.name)
+          const job = findJobByName(args.name, currentScopeId)
 
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found.`)
@@ -2710,7 +2722,7 @@ Commands:
         },
         async execute(args) {
           const format = normalizeFormat(args.format)
-          const job = findJobByName(args.name)
+          const job = findJobByName(args.name, currentScopeId)
 
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found.`)
@@ -2868,7 +2880,7 @@ Commands:
         },
         async execute(args) {
           const format = normalizeFormat(args.format)
-          const job = findJobByName(args.name)
+          const job = findJobByName(args.name, currentScopeId)
 
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found.`)
@@ -2935,7 +2947,12 @@ Commands:
           const jobs = [...loadAllJobsAcrossScopes(), ...loadAllLegacyJobs()]
           const items = jobs.map((job) => ({ job, item: classifyJob(job) }))
           const lines: string[] = []
+          const errors: { scopeId?: string; slug: string; error: string }[] = []
           let applied = 0
+          if (args.confirm === true) {
+            // Migrated jobs rely on the v2 supervisor (sets PWD for the run); refresh the on-disk copy.
+            ensureSupervisorScript()
+          }
           for (const { job, item } of items) {
             if (item.status === "current") continue
             lines.push(`${item.status.toUpperCase()} ${item.scopeId ?? "legacy"}/${item.slug}: ${item.reasons.join("; ")}`)
@@ -2945,18 +2962,25 @@ Commands:
               continue
             }
             if (args.confirm === true && item.status === "rebuild") {
-              const updated: Job = { ...job, run: stripDroppableV1Fields(getJobRun(job)) }
-              updated.invocation = buildOpencodeArgs(updated)
-              updated.updatedAt = new Date().toISOString()
-              saveJob(updated)
-              // launchd/systemd/cron read the job JSON through the supervisor; Windows embeds the command in the task.
-              if (IS_WINDOWS) installJob(updated)
-              applied++
+              // One bad job must not abort the run after earlier jobs were already saved.
+              try {
+                const updated: Job = { ...job, run: stripDroppableV1Fields(getJobRun(job)) }
+                updated.invocation = buildOpencodeArgs(updated)
+                updated.updatedAt = new Date().toISOString()
+                saveJob(updated)
+                // launchd/systemd/cron read the job JSON through the supervisor; Windows embeds the command in the task.
+                if (IS_WINDOWS) installJob(updated)
+                applied++
+              } catch (error) {
+                const msg = error instanceof Error ? error.message : String(error)
+                errors.push({ scopeId: job.scopeId, slug: job.slug, error: msg })
+                lines.push(`ERROR ${job.scopeId}/${job.slug}: ${msg}`)
+              }
             }
           }
           if (!lines.length) return okResult(format, "All jobs already use OpenCode v2 command lines.", { items: [] })
-          const header = args.confirm === true ? `Applied ${applied} rebuild(s).` : "Dry run (pass confirm=true to apply):"
-          return okResult(format, `${header}\n${lines.join("\n")}`, { items: items.map((x) => x.item), applied })
+          const header = args.confirm === true ? `Applied ${applied} rebuild(s)${errors.length ? `, ${errors.length} error(s)` : ""}.` : "Dry run (pass confirm=true to apply):"
+          return okResult(format, `${header}\n${lines.join("\n")}`, { items: items.map((x) => x.item), applied, errors })
         },
       }),
 
@@ -2991,7 +3015,7 @@ Commands:
         },
         async execute(args) {
           const format = normalizeFormat(args.format)
-          const job = findJobByName(args.name)
+          const job = findJobByName(args.name, currentScopeId)
 
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found. Use list_jobs to see available jobs.`)
@@ -3086,7 +3110,7 @@ Commands:
         },
         async execute(args) {
           const format = normalizeFormat(args.format)
-          const job = findJobByName(args.name)
+          const job = findJobByName(args.name, currentScopeId)
 
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found.`)
