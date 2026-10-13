@@ -91,13 +91,17 @@ Jobs run from the working directory where you created them, picking up your `ope
 | macOS | `launchd` | Full support (supervised scheduled runs) |
 | Linux (systemd available) | `systemd --user` | Full support (supervised scheduled runs) |
 | Linux / POSIX (no systemd) | `cron` (`crontab`) | Fallback backend (no missed-run catch-up) |
-| Windows | `schtasks` (Task Scheduler) | Supported with cron subset mapping (see limits below) |
+| Windows | `schtasks` (Task Scheduler) | Supervised scheduled runs via `supervisor.ps1`; cron subset mapping (see below) |
 
-Windows Task Scheduler limits:
+### Windows
 
-- Cron expressions that use unsupported combinations (for example, month + weekday constraints, or month-only without explicit day-of-month) return a clear error with guidance.
-- Complex cron schedules may be expanded into multiple Windows tasks under `\\OpenCode\\opencode-job-...`.
-- Windows scheduled runs currently do **not** use the supervisor pipeline used on macOS/Linux, so no-overlap and timeout enforcement are not guaranteed by the OS integration itself.
+- **Install**: clone the repo and point `plugins` at the folder, for example `{ "plugins": ["C:/Users/you/opencode-scheduler"] }` in `.opencode/opencode.json`. The GitHub spec (`github:alerios/opencode-scheduler`) is the alternative once `opencode plugin add` works on Windows (it failed in our Windows 11 test).
+- **opencode path**: the task stores an absolute path to `opencode.exe`, found via `OPENCODE_SCHEDULER_OPENCODE_PATH`, then `opencode.exe` in an absolute `PATH` folder (the current directory is never searched), then the running OpenCode binary, then `%USERPROFILE%\.opencode\bin\opencode.exe` and `%LOCALAPPDATA%\Programs\opencode\opencode.exe`. If none is found, `schedule_job` fails and asks you to set `OPENCODE_SCHEDULER_OPENCODE_PATH`. That variable must be an absolute path to an existing file. A `.cmd`/`.bat` file is refused, because cmd.exe would re-parse the prompt; `OPENCODE_SCHEDULER_ALLOW_CMD_SHIM=1` allows one, for test probes only.
+- **How runs work**: each task runs `powershell.exe ... -File %USERPROFILE%\.config\opencode\scheduler\supervisor.ps1 <job.json>`. Like the Perl supervisor on macOS/Linux, it runs the job in its `workdir` (with `PWD` set), skips a run while the previous one is still active, enforces `timeoutSeconds` (kills the process tree), and records the result. Tasks allow starting and continuing on battery, start late after a missed time, and have no Task Scheduler time limit (`timeoutSeconds` is the limit). On timeout the log says `=== Timeout after N seconds ...; killing process tree (taskkill /T /F) ===` instead of the Perl `sending SIGTERM` / `Forcing SIGKILL` lines. If opencode exits while a descendant (an MCP server, for example) still holds its output, log capture stops 3 seconds later. A console window may flash briefly when a run starts, even with `-WindowStyle Hidden`.
+- **Who and when**: tasks run as the logged-in user, and only while that user is logged on.
+- **Logs**: use `job_logs`, or open `%USERPROFILE%\.config\opencode\logs\scheduler\<scopeId>\<slug>.log`. Run records are in `%USERPROFILE%\.config\opencode\scheduler\scopes\<scopeId>\runs\<slug>.jsonl`.
+- **Cron limits**: unsupported combinations (for example, month + weekday constraints, or month-only without explicit day-of-month) return a clear error with guidance. Complex schedules may be expanded into several tasks under `\\OpenCode\\opencode-job-...`; `delete_job` removes all of them.
+- Tasks created before this supervisor existed run the command directly. Run `update_job` (for example, set the same schedule again) to switch them to `supervisor.ps1`.
 
 ---
 

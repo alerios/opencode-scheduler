@@ -19,6 +19,19 @@ import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
 import { buildRunArgs, unsupportedV2Fields, type JobRunSpec, type OpencodeRunFormat } from "./run-args"
 import { SUPERVISOR_SCRIPT } from "./supervisor"
+import { WINDOWS_SUPERVISOR_SCRIPT } from "./supervisor-windows"
+import {
+  WINDOWS_OPENCODE_NOT_FOUND,
+  buildPowerShellEncodedArgs,
+  buildWindowsSupervisorAction,
+  buildWindowsTaskConfigureScript,
+  resolveWindowsOpencode,
+  summarizeExecError,
+  windowsSystemBinaries,
+  windowsTaskNames,
+  windowsTaskNamesToDelete,
+  windowsTaskRunValue,
+} from "./windows"
 import { classifyJob, stripDroppableV1Fields } from "./migrate"
 
 // Storage location - shared with other opencode tools
@@ -28,6 +41,7 @@ const LOGS_DIR = join(OPENCODE_CONFIG, "logs")
 const SCHEDULER_DIR = join(OPENCODE_CONFIG, "scheduler")
 const SCOPES_DIR = join(SCHEDULER_DIR, "scopes")
 const SUPERVISOR_PATH = join(SCHEDULER_DIR, "supervisor.pl")
+const WINDOWS_SUPERVISOR_PATH = join(SCHEDULER_DIR, "supervisor.ps1")
 const SCHEDULER_CONFIG = join(OPENCODE_CONFIG, "opencode-scheduler.json")
 
 // Platform detection
@@ -125,12 +139,15 @@ function scopedLogPath(scopeId: string, slug: string): string {
 export function ensureSupervisorScript(): void {
   ensureDir(SCHEDULER_DIR)
   writeFileSync(SUPERVISOR_PATH, SUPERVISOR_SCRIPT)
+  // Windows scheduled tasks run supervisor.ps1 (Task Scheduler has no Perl).
+  if (IS_WINDOWS) writeFileSync(WINDOWS_SUPERVISOR_PATH, WINDOWS_SUPERVISOR_SCRIPT)
 }
 
 /** Test-only view of storage paths (computed from homedir() at module load). */
 export const __testing = {
   paths: () => ({ scopesDir: SCOPES_DIR, legacyJobsDir: LEGACY_JOBS_DIR, supervisorPath: SUPERVISOR_PATH }),
   deriveScopeId: (workdir: string) => deriveScopeId(workdir),
+  windowsTaskDefinitions: (job: Job, taskRun: string) => cronToWindowsTaskDefinitions(job, taskRun),
 }
 
 // Job type
@@ -384,6 +401,8 @@ function loadPackageInfo(): { name: string; version: string } {
 
 // Find opencode binary
 function findOpencode(): string {
+  if (IS_WINDOWS) return findOpencodeWindows()
+
   // Allow explicit override for edge cases (multiple installs, etc.)
   const override = process.env.OPENCODE_SCHEDULER_OPENCODE_PATH?.trim()
   if (override) return override
@@ -422,6 +441,21 @@ function findOpencode(): string {
   }
 
   return "opencode" // hope it's in PATH
+}
+
+// Windows: a scheduled task needs an absolute path (it does not get an interactive shell's PATH lookup).
+function findOpencodeWindows(): string {
+  const resolved = resolveWindowsOpencode({
+    override: process.env.OPENCODE_SCHEDULER_OPENCODE_PATH,
+    allowCmdShim: process.env.OPENCODE_SCHEDULER_ALLOW_CMD_SHIM === "1",
+    pathEnv: process.env.PATH,
+    execPath: process.execPath,
+    userProfile: process.env.USERPROFILE,
+    localAppData: process.env.LOCALAPPDATA,
+    exists: existsSync,
+  })
+  if (!resolved) throw new Error(WINDOWS_OPENCODE_NOT_FOUND)
+  return resolved
 }
 
 // Get PATH that includes common locations for node/npx
@@ -652,26 +686,6 @@ function windowsTaskBaseName(job: Job): string {
   return `${WINDOWS_TASK_PREFIX}-${scopeId}-${job.slug}`
 }
 
-function windowsTaskName(baseName: string, index: number, total: number): string {
-  const suffix = total > 1 ? `-${index + 1}` : ""
-  return `${WINDOWS_TASK_ROOT}\\${baseName}${suffix}`
-}
-
-function quoteWindowsArg(value: string): string {
-  if (!/[\s"]/u.test(value)) return value
-  return `"${value.replace(/"/g, '""')}"`
-}
-
-function getWindowsInvocation(job: Job): JobInvocation {
-  const invocation = job.invocation ?? buildOpencodeArgs(job)
-  return invocation
-}
-
-function buildWindowsTaskCommand(job: Job): string {
-  const invocation = getWindowsInvocation(job)
-  return [invocation.command, ...invocation.args].map((arg) => quoteWindowsArg(arg)).join(" ")
-}
-
 function maybeStep(field: string): number | null {
   const match = field.match(/^\*\/(\d+)$/)
   if (!match) return null
@@ -769,13 +783,13 @@ function ensureWindowsRepresentable(cron: string): WindowsCronPlan[] {
   return plans
 }
 
-function cronToWindowsTaskDefinitions(job: Job): WindowsTaskDefinition[] {
+// taskRun is the /TR value: the supervisor.ps1 action (see installWindowsJob), never the prompt.
+function cronToWindowsTaskDefinitions(job: Job, taskRun: string): WindowsTaskDefinition[] {
   const plans = ensureWindowsRepresentable(job.schedule)
-  const baseName = windowsTaskBaseName(job)
-  const command = buildWindowsTaskCommand(job)
+  const names = windowsTaskNames(WINDOWS_TASK_ROOT, windowsTaskBaseName(job), plans.length)
 
   return plans.map((plan, index) => {
-    const args = ["/Create", "/F", "/TN", windowsTaskName(baseName, index, plans.length), "/TR", command, "/SC", plan.schedule]
+    const args = ["/Create", "/F", "/TN", names[index], "/TR", taskRun, "/SC", plan.schedule]
 
     if (plan.modifier) {
       args.push("/MO", plan.modifier)
@@ -794,7 +808,7 @@ function cronToWindowsTaskDefinitions(job: Job): WindowsTaskDefinition[] {
     }
 
     args.push("/ST", plan.startTime)
-    return { name: windowsTaskName(baseName, index, plans.length), args }
+    return { name: names[index], args }
   })
 }
 
@@ -1027,26 +1041,40 @@ function installWindowsJob(job: Job): void {
   // Remove stale task variants before (re)creating current definitions.
   uninstallWindowsJob(job)
 
-  const taskDefinitions = cronToWindowsTaskDefinitions(job)
-  for (const task of taskDefinitions) {
-    execFileSync("schtasks", task.args, { stdio: "ignore" })
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
+  ensureDir(LOGS_DIR)
+  ensureDir(scopeLogsDir(scopeId))
+  ensureSupervisorScript()
+
+  // Like launchd/systemd/cron: the task runs the supervisor on the job JSON, which sets the
+  // working directory/PWD, writes the log and run records, and enforces timeoutSeconds.
+  const action = buildWindowsSupervisorAction(WINDOWS_SUPERVISOR_PATH, jobFilePath(scopeId, job.slug))
+  const taskDefinitions = cronToWindowsTaskDefinitions(job, windowsTaskRunValue(action))
+  const bins = windowsSystemBinaries(process.env.SystemRoot)
+  let step = "schtasks /Create"
+  try {
+    for (const task of taskDefinitions) {
+      execFileSync(bins.schtasks, task.args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
+    }
+    // schtasks.exe cannot change battery settings (defaults skip runs on battery), StartWhenAvailable or ExecutionTimeLimit.
+    step = "Set-ScheduledTask"
+    const script = buildWindowsTaskConfigureScript(taskDefinitions.map((task) => task.name), action)
+    execFileSync(bins.powershell, buildPowerShellEncodedArgs(script), { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
+  } catch (error) {
+    // Never leave a half-configured task behind (e.g. a placeholder action or battery defaults).
+    uninstallWindowsJob(job)
+    throw new Error(`Failed to create the Windows scheduled task(s) (${step}): ${summarizeExecError(error)}`)
   }
 }
 
 function uninstallWindowsJob(job: Job): void {
-  const candidates = new Set<string>()
-  const scopedBase = windowsTaskBaseName(job)
-  const legacyBase = `${WINDOWS_TASK_PREFIX}-${job.slug}`
+  // Same name helper as creation (unsuffixed, -1..-64), for the scoped and the pre-scope legacy base.
+  const candidates = windowsTaskNamesToDelete(WINDOWS_TASK_ROOT, [windowsTaskBaseName(job), `${WINDOWS_TASK_PREFIX}-${job.slug}`])
 
-  for (let i = 0; i < 64; i += 1) {
-    const suffix = i === 0 ? "" : `-${i + 1}`
-    candidates.add(`${WINDOWS_TASK_ROOT}\\${scopedBase}${suffix}`)
-    candidates.add(`${WINDOWS_TASK_ROOT}\\${legacyBase}${suffix}`)
-  }
-
+  const schtasks = windowsSystemBinaries(process.env.SystemRoot).schtasks
   for (const taskName of candidates) {
     try {
-      execFileSync("schtasks", ["/Delete", "/TN", taskName, "/F"], { stdio: "ignore" })
+      execFileSync(schtasks, ["/Delete", "/TN", taskName, "/F"], { stdio: "ignore", windowsHide: true })
     } catch {}
   }
 }
@@ -2450,7 +2478,7 @@ export function buildTools(workdir: string): Record<string, ToolSpec> {
 
              const platformName = backend
              const reliabilityLine = backend === "schtasks"
-               ? "Windows note: scheduled runs use Task Scheduler directly. For advanced reliability guarantees, prefer simple cron schedules or split complex jobs."
+               ? "Windows note: Task Scheduler runs supervisor.ps1 as you, only while you are logged on (logs: job_logs). Prefer simple cron schedules; complex ones become several tasks."
                : backend === "cron"
                  ? "Cron note: missed runs during sleep are not replayed. For catch-up behavior, use launchd or systemd when available."
                  : "The job will run at the scheduled time. If your computer was asleep, it will catch up when it wakes."
@@ -2559,8 +2587,13 @@ Commands:
         async execute(args) {
           const format = normalizeFormat(args.format)
           const packageInfo = loadPackageInfo()
-          const opencodePath = findOpencode()
-          const opencodeVersion = getOpencodeVersion(opencodePath)
+          let opencodePath: string
+          try {
+            opencodePath = findOpencode()
+          } catch (error) {
+            opencodePath = `not found (${error instanceof Error ? error.message : String(error)})`
+          }
+          const opencodeVersion = opencodePath.startsWith("not found") ? null : getOpencodeVersion(opencodePath)
           const lines = [
             `Scheduler Plugin: ${packageInfo.name}@${packageInfo.version}`,
             `Opencode Binary: ${opencodePath}`,
@@ -2976,7 +3009,7 @@ Commands:
                 updated.invocation = buildOpencodeArgs(updated)
                 updated.updatedAt = new Date().toISOString()
                 saveJob(updated)
-                // launchd/systemd/cron read the job JSON through the supervisor; Windows embeds the command in the task.
+                // The supervisor reads the job JSON; reinstall on Windows so pre-supervisor tasks get the supervisor.ps1 action.
                 if (IS_WINDOWS) installJob(updated)
                 applied++
               } catch (error) {

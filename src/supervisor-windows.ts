@@ -1,0 +1,358 @@
+/**
+ * Windows counterpart of supervisor.pl, written to ~/.config/opencode/scheduler/supervisor.ps1.
+ *
+ * Task Scheduler runs:
+ *   powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File supervisor.ps1 <job.json>
+ *
+ * It mirrors supervisor.pl: same log path and `===` markers, same run-record JSONL fields,
+ * same lastRun* job JSON updates, a lock file against overlapping runs, and timeoutSeconds
+ * (kills the process tree; recorded like the Perl supervisor: status=failed, error=timeout,
+ * exitCode=124). Targets Windows PowerShell 5.1.
+ *
+ * Kept as a String.raw template: it must contain no backtick and no dollar-brace sequence,
+ * and must stay pure ASCII (PowerShell 5.1 reads a BOM-less .ps1 in the ANSI code page).
+ */
+export const WINDOWS_SUPERVISOR_SCRIPT = String.raw`# opencode-scheduler supervisor (Windows) v1
+# Usage: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File supervisor.ps1 <job.json>
+param([string]$JobPath)
+
+$ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 may serialize arrays as {"value":[...],"Count":n} while this type data is loaded.
+try { if (Get-TypeData -TypeName System.Array) { Remove-TypeData -TypeName System.Array } } catch {}
+
+$LF = [string][char]10
+$Utf8 = New-Object System.Text.UTF8Encoding($false)
+$InvariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
+$logPath = $null
+$lockPath = $null
+
+function Get-IsoNow {
+  # Same shape as supervisor.pl's strftime("%Y-%m-%dT%H:%M:%S%z").
+  $s = [DateTime]::Now.ToString("yyyy-MM-dd'T'HH:mm:sszzz", $InvariantCulture)
+  return ($s -replace ':(\d\d)$', '$1')
+}
+
+function Read-JsonFile([string]$Path) {
+  return ([System.IO.File]::ReadAllText($Path) | ConvertFrom-Json)
+}
+
+function Write-JsonAtomic([string]$Path, $Data) {
+  $tmp = $Path + '.tmp.' + $PID
+  [System.IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject $Data -Depth 50), $Utf8)
+  if ([System.IO.File]::Exists($Path)) {
+    try { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
+    catch { [System.IO.File]::Copy($tmp, $Path, $true); [System.IO.File]::Delete($tmp) }
+  } else {
+    [System.IO.File]::Move($tmp, $Path)
+  }
+}
+
+function Add-JsonlLine([string]$Path, $Data) {
+  [System.IO.File]::AppendAllText($Path, (ConvertTo-Json -InputObject $Data -Depth 10 -Compress) + $LF, $Utf8)
+}
+
+function Set-Prop($Obj, [string]$Name, $Value) {
+  $Obj | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+}
+
+function Remove-Prop($Obj, [string]$Name) {
+  [void]$Obj.PSObject.Properties.Remove($Name)
+}
+
+# Open, append, close on every write: a held FileMode.Append stream keeps its own position, so
+# a second supervisor's "skipped" line would be overwritten by this run's next write.
+function Write-Log([string]$Text) {
+  if (-not $logPath) { return }
+  $bytes = $Utf8.GetBytes($Text)
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    try {
+      $fs = New-Object System.IO.FileStream($logPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+      try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+      return
+    } catch {
+      Start-Sleep -Milliseconds 50
+    }
+  }
+}
+
+function Get-ProcStart($ProcessId) {
+  try { return (Get-Process -Id $ProcessId -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o', $InvariantCulture) } catch { return $null }
+}
+
+# Lock owner still running? Compares the process start time too, so a reused PID is not mistaken for the owner.
+function Test-LockOwnerAlive($LockData) {
+  if (-not $LockData -or -not $LockData.pid) { return $false }
+  $ownerStart = Get-ProcStart ([int]$LockData.pid)
+  if (-not $ownerStart) { return $false }
+  if (-not $LockData.procStart) { return $true }
+  try {
+    $delta = [DateTime]::Parse($ownerStart, $InvariantCulture).ToUniversalTime() - [DateTime]::Parse([string]$LockData.procStart, $InvariantCulture).ToUniversalTime()
+    return ([Math]::Abs($delta.TotalSeconds) -lt 2)
+  } catch { return $true }
+}
+
+# Create the lock atomically (fails if another run created it first).
+function New-LockFile([string]$Path, $Data) {
+  try {
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+  } catch {
+    return $false
+  }
+  try {
+    $bytes = $Utf8.GetBytes((ConvertTo-Json -InputObject $Data -Depth 5))
+    $stream.Write($bytes, 0, $bytes.Length)
+  } finally {
+    $stream.Dispose()
+  }
+  return $true
+}
+
+function Stop-ProcessTree($ProcessId) {
+  try {
+    $kill = New-Object System.Diagnostics.ProcessStartInfo
+    $kill.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    $kill.Arguments = '/PID ' + $ProcessId + ' /T /F'
+    $kill.UseShellExecute = $false
+    $kill.CreateNoWindow = $true
+    $killer = [System.Diagnostics.Process]::Start($kill)
+    [void]$killer.WaitForExit(15000)
+  } catch {}
+}
+
+# Quote one argument for CreateProcess / CommandLineToArgvW (MSVCRT rules).
+function ConvertTo-WinArg([string]$Value) {
+  if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.Append('"')
+  $bs = 0
+  foreach ($ch in $Value.ToCharArray()) {
+    if ($ch -eq [char]'\') { $bs++; continue }
+    if ($ch -eq [char]'"') { [void]$sb.Append([char]'\', 2 * $bs + 1) }
+    elseif ($bs -gt 0) { [void]$sb.Append([char]'\', $bs) }
+    $bs = 0
+    [void]$sb.Append($ch)
+  }
+  if ($bs -gt 0) { [void]$sb.Append([char]'\', 2 * $bs) }
+  [void]$sb.Append('"')
+  return $sb.ToString()
+}
+
+# Must never throw itself: no script helpers or culture variables, every step guarded.
+trap {
+  $trapRecord = $_
+  try {
+    $trapMessage = 'unknown error'
+    try { $trapMessage = [string]$trapRecord.Exception.Message } catch {}
+    $trapStamp = ''
+    try { $trapStamp = [DateTime]::Now.ToString('o') } catch {}
+    if ($logPath) { [System.IO.File]::AppendAllText($logPath, [string][char]10 + '=== Supervisor error ' + $trapStamp + ': ' + $trapMessage + ' ===' + [string][char]10, (New-Object System.Text.UTF8Encoding($false))) }
+  } catch {}
+  try { if ($lockPath) { Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue } } catch {}
+  exit 1
+}
+
+if (-not $JobPath) { [Console]::Error.WriteLine('usage: supervisor.ps1 <job.json>'); exit 2 }
+
+$job = Read-JsonFile $JobPath
+$scopeId = [string]$job.scopeId
+$slug = [string]$job.slug
+if (-not $scopeId -or -not $slug) { [Console]::Error.WriteLine('job missing scopeId/slug'); exit 2 }
+
+# Same root as the plugin: Node's os.homedir() is %USERPROFILE% on Windows.
+$homeDir = $env:USERPROFILE
+if (-not $homeDir) { $homeDir = [Environment]::GetFolderPath('UserProfile') }
+
+$configRoot = Join-Path $homeDir '.config\opencode'
+$schedulerRoot = Join-Path $configRoot "scheduler\scopes\$scopeId"
+$locksDir = Join-Path $schedulerRoot 'locks'
+$runsDir = Join-Path $schedulerRoot 'runs'
+$logsDir = Join-Path $configRoot "logs\scheduler\$scopeId"
+foreach ($dir in @($locksDir, $runsDir, $logsDir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+
+$logPath = Join-Path $logsDir "$slug.log"
+
+$candidateLock = Join-Path $locksDir "$slug.json"
+if (Test-Path -LiteralPath $candidateLock) {
+  $lockPid = 0
+  $lock = $null
+  try { $lock = Read-JsonFile $candidateLock; if ($lock.pid) { $lockPid = [int]$lock.pid } } catch {}
+  if (Test-LockOwnerAlive $lock) {
+    Write-Log ($LF + "=== Scheduled run skipped (already running pid=$lockPid) " + (Get-IsoNow) + ' ===' + $LF)
+    exit 0
+  }
+  Remove-Item -LiteralPath $candidateLock -Force -ErrorAction SilentlyContinue
+}
+
+$random = New-Object System.Random
+$runId = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0).ToString($InvariantCulture) + '-' + $random.Next(0, 1000000000).ToString('000000000', $InvariantCulture)
+$startedAt = Get-IsoNow
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+if (-not (New-LockFile $candidateLock ([ordered]@{ pid = $PID; procStart = (Get-ProcStart $PID); runId = $runId; startedAt = $startedAt }))) {
+  # Another run created the lock between the check above and now.
+  Write-Log ($LF + '=== Scheduled run skipped (already running) ' + (Get-IsoNow) + ' ===' + $LF)
+  exit 0
+}
+# Only now is the lock ours to delete.
+$lockPath = $candidateLock
+
+# Update job metadata: running
+Set-Prop $job 'lastRunAt' $startedAt
+Set-Prop $job 'lastRunSource' 'scheduled'
+Set-Prop $job 'lastRunStatus' 'running'
+Remove-Prop $job 'lastRunExitCode'
+Remove-Prop $job 'lastRunError'
+Set-Prop $job 'updatedAt' $startedAt
+Write-JsonAtomic $JobPath $job
+
+# Force non-interactive scheduled runs (parity with supervisor.pl; OpenCode v2 ignores it).
+$perm = [ordered]@{}
+if ($env:OPENCODE_PERMISSION) {
+  try {
+    $existing = $env:OPENCODE_PERMISSION | ConvertFrom-Json
+    foreach ($p in $existing.PSObject.Properties) { $perm[$p.Name] = $p.Value }
+  } catch {}
+}
+$perm['question'] = 'deny'
+
+Write-Log ($LF + "=== Scheduled run $startedAt runId=$runId ===" + $LF)
+
+$invocation = $job.invocation
+if (-not $invocation -or -not $invocation.command -or -not ($invocation.args -is [array])) {
+  Write-Log ($LF + '=== Supervisor error ' + (Get-IsoNow) + ': job missing invocation.command/args ===' + $LF)
+  $now = Get-IsoNow
+  Set-Prop $job 'lastRunStatus' 'failed'
+  Set-Prop $job 'lastRunError' 'job missing invocation'
+  Set-Prop $job 'updatedAt' $now
+  Write-JsonAtomic $JobPath $job
+  Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+  exit 1
+}
+
+$workdir = [string]$job.workdir
+if (-not $workdir) { $workdir = $homeDir }
+
+$timeout = $null
+if ($null -ne $job.timeoutSeconds -and ([string]$job.timeoutSeconds) -match '^\d+$') { $timeout = [int64]$job.timeoutSeconds }
+
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = [string]$invocation.command
+$psi.Arguments = (@($invocation.args | ForEach-Object { ConvertTo-WinArg ([string]$_) }) -join ' ')
+$psi.WorkingDirectory = $workdir
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.RedirectStandardInput = $true
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$psi.StandardOutputEncoding = $Utf8
+$psi.StandardErrorEncoding = $Utf8
+$psi.EnvironmentVariables['PWD'] = $workdir
+$psi.EnvironmentVariables['OPENCODE_PERMISSION'] = (ConvertTo-Json -InputObject $perm -Depth 20 -Compress)
+$psi.EnvironmentVariables['OPENCODE_SCHEDULER_RUN_ID'] = $runId
+
+$timedOut = $false
+$startError = $null
+$childPid = $null
+$exitCode = 1
+$proc = $null
+try {
+  Set-Location -LiteralPath $workdir
+  $env:PWD = $workdir
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  $childPid = $proc.Id
+} catch {
+  $startError = $_.Exception.Message
+  Write-Log ($LF + '=== Supervisor error ' + (Get-IsoNow) + ': ' + $startError + ' ===' + $LF)
+}
+
+if ($proc) {
+  # Like systemd's stdin=/dev/null: the run must never wait for input.
+  $proc.StandardInput.Close()
+  $outReader = $proc.StandardOutput
+  $errReader = $proc.StandardError
+  $outTask = $outReader.ReadLineAsync()
+  $errTask = $errReader.ReadLineAsync()
+  $deadline = $null
+  if ($timeout -gt 0) { $deadline = [DateTime]::UtcNow.AddSeconds($timeout) }
+  $killedAt = $null
+  $exitedAt = $null
+  while ($outTask -or $errTask) {
+    $pending = @()
+    if ($outTask) { $pending += $outTask }
+    if ($errTask) { $pending += $errTask }
+    [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]$pending, 250)
+    if ($outTask -and $outTask.IsCompleted) {
+      $line = $null
+      try { $line = $outTask.Result } catch {}
+      if ($null -eq $line) { $outTask = $null } else { Write-Log ($line + $LF); $outTask = $outReader.ReadLineAsync() }
+    }
+    if ($errTask -and $errTask.IsCompleted) {
+      $line = $null
+      try { $line = $errTask.Result } catch {}
+      if ($null -eq $line) { $errTask = $null } else { Write-Log ($line + $LF); $errTask = $errReader.ReadLineAsync() }
+    }
+    if ($deadline -and -not $timedOut -and [DateTime]::UtcNow -gt $deadline) {
+      $timedOut = $true
+      $killedAt = [DateTime]::UtcNow
+      Write-Log ($LF + "=== Timeout after $timeout seconds " + (Get-IsoNow) + '; killing process tree (taskkill /T /F) ===' + $LF)
+      Stop-ProcessTree $childPid
+      try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+    }
+    # A grandchild that survived the kill could keep the pipes open: stop reading after a grace period.
+    if ($killedAt -and ([DateTime]::UtcNow - $killedAt).TotalSeconds -gt 10) { break }
+    # opencode exited but a descendant (MCP server, LSP, git) still holds the inherited pipes:
+    # drain briefly, then stop instead of waiting forever with the lock held.
+    if (-not $exitedAt -and $proc.HasExited) { $exitedAt = [DateTime]::UtcNow }
+    if ($exitedAt -and ([DateTime]::UtcNow - $exitedAt).TotalSeconds -gt 3) {
+      Write-Log ($LF + '=== Child exited; a descendant still holds its output, stopping log capture ' + (Get-IsoNow) + ' ===' + $LF)
+      break
+    }
+  }
+  [void]$proc.WaitForExit(10000)
+  if ($proc.HasExited) { $exitCode = $proc.ExitCode }
+}
+
+$finishedAt = Get-IsoNow
+$durationMs = [int64][Math]::Floor($stopwatch.Elapsed.TotalMilliseconds)
+if ($timedOut) {
+  $exitCode = 124
+}
+
+$finalStatus = 'failed'
+$finalError = $null
+if ($timedOut) {
+  $finalError = 'timeout'
+} elseif ($startError) {
+  $exitCode = 127
+  $finalError = 'start failed: ' + $startError
+} elseif ($exitCode -eq 0) {
+  $finalStatus = 'success'
+} else {
+  $finalError = "exit code $exitCode"
+}
+
+Set-Prop $job 'lastRunStatus' $finalStatus
+Set-Prop $job 'lastRunExitCode' $exitCode
+if ($null -ne $finalError) { Set-Prop $job 'lastRunError' $finalError }
+Set-Prop $job 'updatedAt' $finishedAt
+Write-JsonAtomic $JobPath $job
+
+Add-JsonlLine (Join-Path $runsDir "$slug.jsonl") ([ordered]@{
+  durationMs = $durationMs
+  error = $finalError
+  exitCode = $exitCode
+  finishedAt = $finishedAt
+  logPath = $logPath
+  pid = $childPid
+  runId = $runId
+  scopeId = $scopeId
+  slug = $slug
+  startedAt = $startedAt
+  status = $finalStatus
+})
+
+Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+$lockPath = $null
+Write-Log ($LF + "=== Finished $finishedAt status=$finalStatus exitCode=$exitCode durationMs=$durationMs ===" + $LF)
+exit $exitCode
+`
