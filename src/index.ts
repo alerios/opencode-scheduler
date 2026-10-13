@@ -26,6 +26,8 @@ import {
   buildWindowsSupervisorAction,
   buildWindowsTaskConfigureScript,
   resolveWindowsOpencode,
+  summarizeExecError,
+  windowsSystemBinaries,
   windowsTaskRunValue,
 } from "./windows"
 import { classifyJob, stripDroppableV1Fields } from "./migrate"
@@ -441,15 +443,10 @@ function findOpencode(): string {
 
 // Windows: a scheduled task needs an absolute path (it does not get an interactive shell's PATH lookup).
 function findOpencodeWindows(): string {
-  let whereOutput: string | null = null
-  try {
-    whereOutput = execFileSync("where.exe", ["opencode"], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true }).toString()
-  } catch {
-    // where.exe exits 1 when nothing matches
-  }
   const resolved = resolveWindowsOpencode({
     override: process.env.OPENCODE_SCHEDULER_OPENCODE_PATH,
-    whereOutput,
+    allowCmdShim: process.env.OPENCODE_SCHEDULER_ALLOW_CMD_SHIM === "1",
+    pathEnv: process.env.PATH,
     execPath: process.execPath,
     userProfile: process.env.USERPROFILE,
     localAppData: process.env.LOCALAPPDATA,
@@ -1056,18 +1053,20 @@ function installWindowsJob(job: Job): void {
   // working directory/PWD, writes the log and run records, and enforces timeoutSeconds.
   const action = buildWindowsSupervisorAction(WINDOWS_SUPERVISOR_PATH, jobFilePath(scopeId, job.slug))
   const taskDefinitions = cronToWindowsTaskDefinitions(job, windowsTaskRunValue(action))
+  const bins = windowsSystemBinaries(process.env.SystemRoot)
+  let step = "schtasks /Create"
   try {
     for (const task of taskDefinitions) {
-      execFileSync("schtasks", task.args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
+      execFileSync(bins.schtasks, task.args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
     }
-    // schtasks.exe cannot change battery settings (defaults skip runs on battery) or StartWhenAvailable.
+    // schtasks.exe cannot change battery settings (defaults skip runs on battery), StartWhenAvailable or ExecutionTimeLimit.
+    step = "Set-ScheduledTask"
     const script = buildWindowsTaskConfigureScript(taskDefinitions.map((task) => task.name), action)
-    execFileSync("powershell.exe", buildPowerShellEncodedArgs(script), { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
+    execFileSync(bins.powershell, buildPowerShellEncodedArgs(script), { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
   } catch (error) {
     // Never leave a half-configured task behind (e.g. a placeholder action or battery defaults).
     uninstallWindowsJob(job)
-    const message = error instanceof Error ? error.message : String(error)
-    throw new Error(`Failed to create the Windows scheduled task(s): ${message}`)
+    throw new Error(`Failed to create the Windows scheduled task(s) (${step}): ${summarizeExecError(error)}`)
   }
 }
 
@@ -1082,9 +1081,10 @@ function uninstallWindowsJob(job: Job): void {
     candidates.add(`${WINDOWS_TASK_ROOT}\\${legacyBase}${suffix}`)
   }
 
+  const schtasks = windowsSystemBinaries(process.env.SystemRoot).schtasks
   for (const taskName of candidates) {
     try {
-      execFileSync("schtasks", ["/Delete", "/TN", taskName, "/F"], { stdio: "ignore" })
+      execFileSync(schtasks, ["/Delete", "/TN", taskName, "/F"], { stdio: "ignore", windowsHide: true })
     } catch {}
   }
 }
