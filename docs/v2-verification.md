@@ -2,7 +2,9 @@
 
 Host: `opencode v2.0.26` (`/home/arios/.opencode/bin/opencode`), systemd user instance healthy
 (585 units loaded, 0 failed at test start). Scratch project: `/tmp/sched-v2` (fresh `git init`).
-Plugin source under test: `/home/arios/Tech/ai-magic/opencode-scheduler-v2-wt` at commit `03958ab`.
+Plugin source under test: `/home/arios/Tech/ai-magic/opencode-scheduler-v2-wt`, Steps 1-8 first run at
+commit `03958ab`. Steps 5 and 7 were re-run after the final-review fixes (commits `d66e24e`,
+`fb4a35e`, `0e73f30`); see the **Resolved** notes in those steps and the re-run section at the end.
 
 `bun run build` was run first and produced `dist/plugin.js` (103.65 KB) cleanly with
 `@opencode/plugin` and `effect` external.
@@ -166,6 +168,12 @@ reproducible bug in the plugin's own cron→systemd translation — not an openc
 incompatibility — so per the task brief's guidance this is recorded as a FAIL with full diagnosis
 rather than treated as BLOCKED.
 
+> **Resolved** in `d66e24e` (`cronToSystemdCalendars()` omits the wildcard weekday token) and
+> re-verified end to end; see "Re-run after final-review fixes" below. The failed install also
+> left a dangling `timers.target.wants` symlink (still listed by `systemctl --user list-timers --all`
+> as `not-found` until removed); `0e73f30` makes uninstall run `disable` even when `stop` fails and
+> makes the cron fallback remove the half-installed timer.
+
 `installJob()`'s fallback logic correctly caught the `installSystemdJob` failure (since `cron` was
 available) and fell back to cron automatically, so the job was still installed and still ran for
 real:
@@ -183,7 +191,7 @@ PONG
 ```
 JSONL: `{"status":"success","exitCode":0,...}`. Job JSON `invocation.v: 2`.
 
-**Result: FAIL (systemd timer creation) / PASS (end-to-end scheduled run via automatic cron
+**Result (first run, at `03958ab`): FAIL (systemd timer creation) / PASS (end-to-end scheduled run via automatic cron
 fallback).** The timer was *not* listed in `systemctl --user list-timers` (it never started), so
 the brief's literal "timer is listed" expectation fails. However the job still ran for real on
 schedule, with the expected log marker, `PONG` output, `"status":"success"`, and `"v": 2` — just
@@ -191,6 +199,9 @@ via cron instead of systemd, due to the bug above. **This is the single most imp
 from this verification run** and should block merging Task 5/6 as "done" for Linux systemd users
 until `cronToSystemdCalendars()` drops the leading `"*"`/weekday token whenever `dowValue === "*"`
 (or otherwise emits `*-MM-DD HH:MM:00` instead of `* *-MM-DD HH:MM:00`).
+
+> **Resolved:** that change landed in `d66e24e`; the re-run (below) put `pong-check` on a real
+> systemd timer that fired and succeeded. Result for the re-run: **PASS**.
 
 ## Step 6: Service mode
 
@@ -222,9 +233,10 @@ with a v1-shaped invocation and no `v` field:
 "invocation": {"command": "/home/arios/.opencode/bin/opencode", "args": ["run","--variant","high","--","hi"]}
 ```
 
-Dry run:
+Dry run (`migrate_jobs` has no `dryRun` argument; omitting `confirm` or passing `confirm: false` is
+the dry run):
 ```bash
-opencode run --server http://127.0.0.1:4199 --format json --auto "Use migrate_jobs with dryRun true and show the raw result."
+opencode run --server http://127.0.0.1:4199 --format json --auto "Use migrate_jobs and show the raw result."
 ```
 ```
 "output":"Dry run (pass confirm=true to apply):\nREBUILD sched-v2-3f76f23048cb/v1-legacy-job: saved command line uses v1 flags"
@@ -273,17 +285,93 @@ Output: `The scheduled job "pong-check" has been deleted.` / timer count: `0`. A
 | 2. Legacy `plugin` key | PASS |
 | 3. Skill and command registered | PASS (only after a session runs in-process; see finding) |
 | 4. Direct tools, correct workdir/scope | PASS |
-| 5. Real scheduled run under systemd | **FAIL** for systemd specifically (bad `OnCalendar` generation); PASS for the job actually running, via automatic cron fallback |
+| 5. Real scheduled run under systemd | First run: FAIL for systemd (bad `OnCalendar`), job ran via cron fallback. **Resolved** (`d66e24e`); re-run PASS on a real systemd timer |
 | 6. Service mode | PASS |
-| 7. Migration on a real v1 job | PASS |
+| 7. Migration on a real v1 job | PASS (re-run with `port`+`share` and `command` jobs also PASS after `fb4a35e`) |
 | 8. Clean up | PASS |
 
-8 of 9 explicit step expectations pass; Step 5's systemd-timer-creation sub-expectation fails due
-to a reproducible bug in `cronToSystemdCalendars()` (`src/index.ts`, ~line 606): it emits
-`"${dowValue} *-${month}-${day} ${hour}:${minute}:00"` even when `dowValue` is the wildcard `"*"`,
-which systemd on this host rejects as a bad calendar specification for every such timer. Recommend
-filing this as a follow-up bug fix before relying on systemd scheduling in production on this
-platform; cron remains a working fallback in the meantime.
+All step expectations now pass. The first run's only failure (Step 5, systemd timer creation) was
+a bug in `cronToSystemdCalendars()`: it emitted `"${dowValue} *-${month}-${day} ${hour}:${minute}:00"`
+even when `dowValue` was the wildcard `"*"`, which systemd rejects. **Resolved** in `d66e24e` and
+re-verified with a real systemd timer firing (below); cron remains the automatic fallback.
+
+## Re-run after final-review fixes
+
+Plugin at commit `0e73f30`, same host and scratch project (`/tmp/sched-v2`, plugin loaded through
+`.opencode/opencode.json` `plugins`). Before starting, the dangling `timers.target.wants` symlink
+left by the first Step 5 run was removed and `systemctl --user daemon-reload` run, so
+`systemctl --user list-timers --all | grep -c opencode-job` was `0` and `crontab -l` was empty.
+
+### Step 5 again: real scheduled run under systemd
+
+```bash
+cd /tmp/sched-v2
+opencode run --standalone --auto "Use schedule_job to create a job named pong-check with schedule '*/2 * * * *' and prompt 'Reply with exactly: PONG', autoApprove true, standalone true. ..."
+```
+Tool result: platform **systemd**, working directory `/tmp/sched-v2`.
+
+```
+$ systemctl --user list-timers | grep opencode-job
+Mon 2026-10-12 21:02:00 -05  1s  -  -  opencode-job-sched-v2-3f76f23048cb-pong-check.timer  opencode-job-sched-v2-3f76f23048cb-pong-check.service
+$ crontab -l | grep -c pong
+0
+```
+Timer unit: 30 `OnCalendar=*-*-* *:MM:00` lines (no leading weekday token), `Persistent=true`.
+Job JSON `invocation`: `{"command": "/home/arios/.opencode/bin/opencode", "args": ["run", "--standalone", "--auto", "--", "Reply with exactly: PONG"], "v": 2}`.
+
+After the 21:02 tick:
+```
+=== Scheduled run 2026-10-12T21:02:01-0500 runId=1791856921.71668-126609070 ===
+> build · claude-haiku-5-5
+PONG
+=== Finished 2026-10-12T21:02:04-0500 status=success exitCode=0 durationMs=3171 ===
+```
+JSONL: `{"status":"success","exitCode":0,...,"scopeId":"sched-v2-3f76f23048cb","slug":"pong-check"}`.
+journal: `Starting opencode-job-...-pong-check.service` / `Finished opencode-job-...-pong-check.service`.
+The on-disk `supervisor.pl` matched the current `SUPERVISOR_SCRIPT` byte for byte.
+
+**Result: PASS** (real systemd timer, not the cron fallback).
+
+### Step 7 again: v1 jobs with `port`/`share` and `command`
+
+Before `fb4a35e`, loading a saved job ran the v2 flag check, so any job with `port`, `share`,
+`command` or `variant` without `model` was silently dropped by every loader. Reproduced against
+`2f761ca` vs the fix in an isolated `HOME` with five hand-written v1 jobs:
+```
+== 2f761ca
+list_jobs: plain
+migrate dry-run: plain=rebuild
+get_job port: false
+== fix
+list_jobs: port,share,variant,plain,command
+migrate dry-run: port=rebuild,share=rebuild,variant=manual,plain=rebuild,command=manual
+get_job port: true
+```
+
+Live, in the `sched-v2-3f76f23048cb` scope: hand-wrote `sched-v2-v1-portshare`
+(`run: {prompt:"hi", port:4096, share:true}`, invocation `run --port 4096 --share -- hi`, no `v`) and
+`sched-v2-v1-command` (`run: {command:"review", arguments:"x"}`).
+
+`list_jobs` showed both, marked `(needs migrate_jobs)`; `get_job sched-v2-v1-portshare` succeeded
+(`Share: true`, `Port: 4096`). Dry-run `migrate_jobs` (no arguments):
+```
+Dry run (pass confirm=true to apply):
+MANUAL sched-v2-3f76f23048cb/sched-v2-v1-command: saved command line uses v1 flags; command: OpenCode v2 `run` has no --command; put the instruction in prompt instead
+REBUILD sched-v2-3f76f23048cb/sched-v2-v1-portshare: saved command line uses v1 flags; port will be removed (not supported by OpenCode v2); share will be removed (not supported by OpenCode v2)
+```
+`migrate_jobs` with `confirm: true`: `Applied 1 rebuild(s).`, `errors: []`. Resulting
+`sched-v2-v1-portshare`: `run: {"prompt": "hi"}`, invocation `["run", "--", "hi"]`, `"v": 2`.
+`sched-v2-v1-command` left unchanged (manual).
+
+**Result: PASS.**
+
+### Clean up
+
+`delete_job` for `pong-check`, `sched-v2-v1-portshare`, `sched-v2-v1-command` (all succeeded).
+Afterwards: `systemctl --user list-timers --all | grep -c opencode-job` → `0`; no `opencode-job-*`
+files under `~/.config/systemd/user/` or its `timers.target.wants/`; `crontab -l` empty; the scope's
+`jobs/` directory empty. Every server started for the re-run was a `--standalone` one-shot that
+exited with its `opencode run`.
 
 ## ctx.mcp.transform with headers
 
