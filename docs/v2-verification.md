@@ -284,3 +284,86 @@ to a reproducible bug in `cronToSystemdCalendars()` (`src/index.ts`, ~line 606):
 which systemd on this host rejects as a bad calendar specification for every such timer. Recommend
 filing this as a follow-up bug fix before relying on systemd scheduling in production on this
 platform; cron remains a working fallback in the meantime.
+
+## ctx.mcp.transform with headers
+
+Spike (Task 7, throwaway; not part of the scheduler plugin): proves the `ctx.mcp.transform` /
+`editor.set` API registers a remote MCP server with a bearer `Authorization` header, which is
+exactly how the Workflows, Sources DB and AMM plugins will register their MCP servers. Verified
+against a real bearer-protected MCP server: the AMM repo's own `pnpm mcp-server`
+(`ai-money-magic` repo, `src/server/mcp-server.ts`), not a mock.
+
+Target server: `cd ai-money-magic && LOCAL_MCP_KEY=spike-test-key MCP_PORT=8787 pnpm mcp-server`
+→ `ai-money-magic MCP server listening on http://localhost:8787/mcp`. (One pre-existing
+environment issue, unrelated to this spike, had to be fixed first: the AMM repo's local
+`node_modules` was missing an `esbuild` symlink that `package.json`/the lockfile already declared;
+`pnpm install --frozen-lockfile` fixed it without touching the lockfile — confirmed via `git diff
+pnpm-lock.yaml` showing no change.)
+
+Spike plugin written at `/tmp/sched-v2/.opencode/plugins/mcp-spike/index.ts`:
+
+```ts
+import { Plugin } from "@opencode/plugin"
+
+export default Plugin.define({
+  id: "mcp-spike",
+  async setup(ctx) {
+    await ctx.mcp.transform((editor) => {
+      editor.set("amm-spike", {
+        type: "remote",
+        url: "http://127.0.0.1:8787/mcp",
+        headers: { Authorization: "Bearer spike-test-key" },
+      })
+    })
+  },
+})
+```
+
+This matched the brief's guessed shape exactly — confirmed by reading the real types rather than
+trusting the guess: `MCPEditor.set(name, config: Mcp.ServerConfig)` in
+`/home/arios/Tech/ai-tools/opencode/packages/plugin/src/promise/mcp.ts:9`, and
+`Mcp.ServerConfig`'s remote variant in `/home/arios/Tech/ai-tools/opencode/packages/schema/src/mcp.ts:54-56`:
+```
+type: Schema.Literal("remote"),
+url: Schema.String,
+headers: Schema.Record(Schema.String, Schema.String).pipe(optional),
+```
+No shape mismatch, no typecheck/load failure.
+
+As in Task 6, a bare `opencode api` talks to the host's long-running background service rooted at
+`/home/arios`, not `/tmp/sched-v2` — so this test used a dedicated `opencode serve --port 4199` run
+from `/tmp/sched-v2`, with `OPENCODE_PASSWORD` from its startup banner, and `opencode api`/`opencode
+run --server http://127.0.0.1:4199 ...` for every call, same as Task 6's resolution for this issue.
+
+**Correct key:** after `opencode reload` and one `opencode run --server ... --auto "List the tools
+available from the amm-spike MCP server."` session (mcp.list only populates after a session has
+run, same finding as Task 6 Step 3), `opencode api mcp.list --server http://127.0.0.1:4199` showed:
+```json
+{"name":"amm-spike","status":{"status":"connected"},"integrationID":"mcp_bc16a90e3907ae0d"}
+```
+The run session's tool catalog (via the Code Mode `search`/`execute` tools; `tools.opencode.list_mcp_tools`
+does not exist in this host version) listed 25 AMM tools under `amm-spike`, including
+`collect_keyword_data`, confirming the connection surfaced real AMM tools, not just a stub
+connection.
+
+**Wrong key (proves the header is actually sent, not just accepted locally):** changed the plugin's
+header to `Authorization: "Bearer wrong-key"`, `opencode reload`, and `mcp.list` immediately
+flipped to:
+```json
+{"name":"amm-spike","status":{"status":"needs_auth","error":"MCP server \"http://127.0.0.1:8787/mcp\" requires a login before it can register a client"}}
+```
+This matches the AMM server's own bearer check (`checkBearerToken` in `src/server/auth.ts`, called
+from `src/server/mcp-server.ts:305`), which returns 401 for a non-matching key. Reverting the header
+back to `Bearer spike-test-key` and reloading flipped `amm-spike` back to `"status":"connected"`
+immediately, confirming the state change tracks the header value, not a cache or a fluke.
+
+**Result: PASS.** `ctx.mcp.transform` / `editor.set("name", { type: "remote", url, headers })` is a
+working, confirmed mechanism for registering a remote MCP server with bearer auth, with the header
+demonstrably read and enforced by a real downstream server — this is safe for the Workflows,
+Sources DB and AMM plugins to use as designed, with no shape surprises against the brief's assumed
+API.
+
+Cleanup: the `ai-money-magic` pre-existing dirty `git status` (unrelated in-progress doc edits, not
+touched by this spike) was unchanged before/after; `pnpm-lock.yaml` diff was empty; the AMM
+`pnpm mcp-server` process and the standalone `opencode serve --port 4199` were both killed; the
+spike plugin directory `/tmp/sched-v2/.opencode/plugins/mcp-spike/` was removed.
