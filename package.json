@@ -2,25 +2,20 @@
   "name": "opencode-scheduler",
   "version": "2.0.0-alpha.0",
   "description": "OpenCode plugin for scheduling recurring jobs using launchd, systemd, Task Scheduler, or cron fallback",
-  "main": "dist/plugin.js",
-  "types": "dist/plugin.d.ts",
+  "main": "server.ts",
   "type": "module",
   "files": [
-    "dist",
     "src",
     "server.ts"
   ],
   "exports": {
     "./server": "./server.ts",
-    ".": {
-      "types": "./dist/plugin.d.ts",
-      "import": "./dist/plugin.js"
-    }
+    ".": "./server.ts"
   },
   "scripts": {
-    "build": "bun build src/plugin.ts --outdir dist --target bun --format esm --external @opencode/plugin --external effect && tsc --emitDeclarationOnly",
+    "build:dist": "bun build src/plugin.ts --outdir dist --target bun --format esm --external @opencode/plugin --external effect && tsc --emitDeclarationOnly",
     "clean": "rm -rf dist",
-    "prepublishOnly": "bun run clean && bun run build",
+    "prepublishOnly": "bun run clean && bun run build:dist",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
