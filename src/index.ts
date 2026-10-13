@@ -28,6 +28,8 @@ import {
   resolveWindowsOpencode,
   summarizeExecError,
   windowsSystemBinaries,
+  windowsTaskNames,
+  windowsTaskNamesToDelete,
   windowsTaskRunValue,
 } from "./windows"
 import { classifyJob, stripDroppableV1Fields } from "./migrate"
@@ -684,11 +686,6 @@ function windowsTaskBaseName(job: Job): string {
   return `${WINDOWS_TASK_PREFIX}-${scopeId}-${job.slug}`
 }
 
-function windowsTaskName(baseName: string, index: number, total: number): string {
-  const suffix = total > 1 ? `-${index + 1}` : ""
-  return `${WINDOWS_TASK_ROOT}\\${baseName}${suffix}`
-}
-
 function maybeStep(field: string): number | null {
   const match = field.match(/^\*\/(\d+)$/)
   if (!match) return null
@@ -789,10 +786,10 @@ function ensureWindowsRepresentable(cron: string): WindowsCronPlan[] {
 // taskRun is the /TR value: the supervisor.ps1 action (see installWindowsJob), never the prompt.
 function cronToWindowsTaskDefinitions(job: Job, taskRun: string): WindowsTaskDefinition[] {
   const plans = ensureWindowsRepresentable(job.schedule)
-  const baseName = windowsTaskBaseName(job)
+  const names = windowsTaskNames(WINDOWS_TASK_ROOT, windowsTaskBaseName(job), plans.length)
 
   return plans.map((plan, index) => {
-    const args = ["/Create", "/F", "/TN", windowsTaskName(baseName, index, plans.length), "/TR", taskRun, "/SC", plan.schedule]
+    const args = ["/Create", "/F", "/TN", names[index], "/TR", taskRun, "/SC", plan.schedule]
 
     if (plan.modifier) {
       args.push("/MO", plan.modifier)
@@ -811,7 +808,7 @@ function cronToWindowsTaskDefinitions(job: Job, taskRun: string): WindowsTaskDef
     }
 
     args.push("/ST", plan.startTime)
-    return { name: windowsTaskName(baseName, index, plans.length), args }
+    return { name: names[index], args }
   })
 }
 
@@ -1071,15 +1068,8 @@ function installWindowsJob(job: Job): void {
 }
 
 function uninstallWindowsJob(job: Job): void {
-  const candidates = new Set<string>()
-  const scopedBase = windowsTaskBaseName(job)
-  const legacyBase = `${WINDOWS_TASK_PREFIX}-${job.slug}`
-
-  for (let i = 0; i < 64; i += 1) {
-    const suffix = i === 0 ? "" : `-${i + 1}`
-    candidates.add(`${WINDOWS_TASK_ROOT}\\${scopedBase}${suffix}`)
-    candidates.add(`${WINDOWS_TASK_ROOT}\\${legacyBase}${suffix}`)
-  }
+  // Same name helper as creation (unsuffixed, -1..-64), for the scoped and the pre-scope legacy base.
+  const candidates = windowsTaskNamesToDelete(WINDOWS_TASK_ROOT, [windowsTaskBaseName(job), `${WINDOWS_TASK_PREFIX}-${job.slug}`])
 
   const schtasks = windowsSystemBinaries(process.env.SystemRoot).schtasks
   for (const taskName of candidates) {

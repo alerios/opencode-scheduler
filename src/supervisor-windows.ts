@@ -23,7 +23,7 @@ try { if (Get-TypeData -TypeName System.Array) { Remove-TypeData -TypeName Syste
 $LF = [string][char]10
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $InvariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
-$log = $null
+$logPath = $null
 $lockPath = $null
 
 function Get-IsoNow {
@@ -59,8 +59,20 @@ function Remove-Prop($Obj, [string]$Name) {
   [void]$Obj.PSObject.Properties.Remove($Name)
 }
 
+# Open, append, close on every write: a held FileMode.Append stream keeps its own position, so
+# a second supervisor's "skipped" line would be overwritten by this run's next write.
 function Write-Log([string]$Text) {
-  if ($log) { $log.Write($Text) }
+  if (-not $logPath) { return }
+  $bytes = $Utf8.GetBytes($Text)
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    try {
+      $fs = New-Object System.IO.FileStream($logPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+      try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+      return
+    } catch {
+      Start-Sleep -Milliseconds 50
+    }
+  }
 }
 
 function Get-ProcStart($ProcessId) {
@@ -133,10 +145,9 @@ trap {
     try { $trapMessage = [string]$trapRecord.Exception.Message } catch {}
     $trapStamp = ''
     try { $trapStamp = [DateTime]::Now.ToString('o') } catch {}
-    if ($log) { $log.Write([string][char]10 + '=== Supervisor error ' + $trapStamp + ': ' + $trapMessage + ' ===' + [string][char]10) }
+    if ($logPath) { [System.IO.File]::AppendAllText($logPath, [string][char]10 + '=== Supervisor error ' + $trapStamp + ': ' + $trapMessage + ' ===' + [string][char]10, (New-Object System.Text.UTF8Encoding($false))) }
   } catch {}
   try { if ($lockPath) { Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue } } catch {}
-  try { if ($log) { $log.Dispose() } } catch {}
   exit 1
 }
 
@@ -159,9 +170,6 @@ $logsDir = Join-Path $configRoot "logs\scheduler\$scopeId"
 foreach ($dir in @($locksDir, $runsDir, $logsDir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
 
 $logPath = Join-Path $logsDir "$slug.log"
-$logStream = New-Object System.IO.FileStream($logPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-$log = New-Object System.IO.StreamWriter($logStream, $Utf8)
-$log.AutoFlush = $true
 
 $candidateLock = Join-Path $locksDir "$slug.json"
 if (Test-Path -LiteralPath $candidateLock) {
@@ -170,7 +178,6 @@ if (Test-Path -LiteralPath $candidateLock) {
   try { $lock = Read-JsonFile $candidateLock; if ($lock.pid) { $lockPid = [int]$lock.pid } } catch {}
   if (Test-LockOwnerAlive $lock) {
     Write-Log ($LF + "=== Scheduled run skipped (already running pid=$lockPid) " + (Get-IsoNow) + ' ===' + $LF)
-    $log.Dispose()
     exit 0
   }
   Remove-Item -LiteralPath $candidateLock -Force -ErrorAction SilentlyContinue
@@ -184,7 +191,6 @@ $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 if (-not (New-LockFile $candidateLock ([ordered]@{ pid = $PID; procStart = (Get-ProcStart $PID); runId = $runId; startedAt = $startedAt }))) {
   # Another run created the lock between the check above and now.
   Write-Log ($LF + '=== Scheduled run skipped (already running) ' + (Get-IsoNow) + ' ===' + $LF)
-  $log.Dispose()
   exit 0
 }
 # Only now is the lock ours to delete.
@@ -220,7 +226,6 @@ if (-not $invocation -or -not $invocation.command -or -not ($invocation.args -is
   Set-Prop $job 'updatedAt' $now
   Write-JsonAtomic $JobPath $job
   Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
-  $log.Dispose()
   exit 1
 }
 
@@ -349,6 +354,5 @@ Add-JsonlLine (Join-Path $runsDir "$slug.jsonl") ([ordered]@{
 Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
 $lockPath = $null
 Write-Log ($LF + "=== Finished $finishedAt status=$finalStatus exitCode=$exitCode durationMs=$durationMs ===" + $LF)
-$log.Dispose()
 exit $exitCode
 `
