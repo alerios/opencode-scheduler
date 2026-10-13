@@ -20,6 +20,7 @@ import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
 import { buildRunArgs, unsupportedV2Fields, type JobRunSpec, type OpencodeRunFormat } from "./run-args"
 import { SUPERVISOR_SCRIPT } from "./supervisor"
+import { classifyJob, stripDroppableV1Fields } from "./migrate"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -2504,13 +2505,14 @@ Commands:
             const trimmed = preview.trim()
             const snippet = trimmed.slice(0, 50) + (trimmed.length > 50 ? "..." : "")
 
-            return `${i + 1}. ${j.name} (${j.slug})
+            const migrate = classifyJob(j).status !== "current" ? " (needs migrate_jobs)" : ""
+            return `${i + 1}. ${j.name} (${j.slug})${migrate}
    ${describeCron(j.schedule)}
    ${snippet}`
           })
 
-
-          return okResult(format, `Scheduled Jobs\n\n${lines.join("\n\n")}`, { jobs })
+          const data = jobs.map((j) => ({ ...j, needsMigration: classifyJob(j).status !== "current" }))
+          return okResult(format, `Scheduled Jobs\n\n${lines.join("\n\n")}`, { jobs: data })
         },
       }),
 
@@ -2903,6 +2905,43 @@ Commands:
             scopeIds: plan.scopeIds,
             jobsConsidered: plan.jobsToUninstall.length,
           })
+        },
+      }),
+
+      migrate_jobs: tool({
+        description:
+          "Rebuild saved command lines of jobs created for OpenCode v1 so they run on OpenCode v2. Dry run by default; pass confirm=true to apply. Jobs that need a manual edit are listed, not changed.",
+        args: {
+          confirm: tool.schema.boolean().optional().describe("Apply the changes (default false = dry run)."),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format)
+          const jobs = [...loadAllJobsAcrossScopes(), ...loadAllLegacyJobs()]
+          const items = jobs.map((job) => ({ job, item: classifyJob(job) }))
+          const lines: string[] = []
+          let applied = 0
+          for (const { job, item } of items) {
+            if (item.status === "current") continue
+            lines.push(`${item.status.toUpperCase()} ${item.scopeId ?? "legacy"}/${item.slug}: ${item.reasons.join("; ")}`)
+            if (!job.scopeId) {
+              // Legacy (pre-scope) jobs live outside scope storage; saving would move them. Report only.
+              lines.push(`  legacy job: delete it and re-create it with schedule_job`)
+              continue
+            }
+            if (args.confirm === true && item.status === "rebuild") {
+              const updated: Job = { ...job, run: stripDroppableV1Fields(getJobRun(job)) }
+              updated.invocation = buildOpencodeArgs(updated)
+              updated.updatedAt = new Date().toISOString()
+              saveJob(updated)
+              // launchd/systemd/cron read the job JSON through the supervisor; Windows embeds the command in the task.
+              if (IS_WINDOWS) installJob(updated)
+              applied++
+            }
+          }
+          if (!lines.length) return okResult(format, "All jobs already use OpenCode v2 command lines.", { items: [] })
+          const header = args.confirm === true ? `Applied ${applied} rebuild(s).` : "Dry run (pass confirm=true to apply):"
+          return okResult(format, `${header}\n${lines.join("\n")}`, { items: items.map((x) => x.item), applied })
         },
       }),
 
