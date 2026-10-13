@@ -993,8 +993,12 @@ function uninstallSystemdJob(job: Job): void {
   const legacyTimerUnit = `opencode-job-${job.slug}.timer`
 
   for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
+    // Separate attempts: a failed/never-started timer can make `stop` fail, and skipping
+    // `disable` would leave a dangling timers.target.wants symlink after the files are removed.
     try {
       execSync(`systemctl --user stop ${timerUnit}`, { stdio: "ignore" })
+    } catch {}
+    try {
       execSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" })
     } catch {}
   }
@@ -1233,6 +1237,10 @@ function installJob(job: Job): SchedulerBackend {
       if (!isCronAvailable()) {
         throw error
       }
+      // Don't leave a half-installed (enabled but unstartable) timer behind the cron fallback.
+      try {
+        uninstallSystemdJob(job)
+      } catch {}
       installCronJob(job)
       return "cron"
     }
