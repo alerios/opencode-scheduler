@@ -18,6 +18,7 @@ import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
 import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
+import { buildRunArgs, unsupportedV2Fields, type JobRunSpec, type OpencodeRunFormat } from "./run-args"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -357,8 +358,6 @@ function ensureSupervisorScript(): void {
 
 // Job type
 
-type OpencodeRunFormat = "default" | "json"
-
 type SchedulerEnvConfig = {
   preserve?: string[]
   set?: Record<string, string>
@@ -369,28 +368,11 @@ type SchedulerConfig = {
   env?: SchedulerEnvConfig
 }
 
-interface JobRunSpec {
-  prompt?: string
-  command?: string
-  arguments?: string
-
-  files?: string[]
-  agent?: string
-  model?: string
-  variant?: string
-  title?: string
-  share?: boolean
-  continue?: boolean
-  session?: string
-  runFormat?: OpencodeRunFormat
-
-  attachUrl?: string
-  port?: number
-}
-
 type JobInvocation = {
   command: string
   args: string[]
+  /** 2 = built for OpenCode v2 `run` flags. Missing = v1 snapshot that needs migrate_jobs. */
+  v?: 2
 }
 
 interface Job {
@@ -1905,6 +1887,9 @@ function normalizeRunSpec(run: JobRunSpec): JobRunSpec {
     normalized.port = undefined
   }
 
+  if (normalized.autoApprove !== true) normalized.autoApprove = undefined
+  if (normalized.standalone !== true) normalized.standalone = undefined
+
   return normalized
 }
 
@@ -1936,6 +1921,11 @@ function validateRunSpec(run: JobRunSpec): void {
 
   if (run.runFormat !== undefined && run.runFormat !== "default" && run.runFormat !== "json") {
     throw new Error("run.runFormat must be 'default' or 'json'")
+  }
+
+  const v2Issues = unsupportedV2Fields(run)
+  if (v2Issues.length) {
+    throw new Error(v2Issues.join("; "))
   }
 }
 
@@ -1994,6 +1984,7 @@ function sanitizeJob(job: Job): Job {
     sanitized.invocation = {
       command: rec.command,
       args: rec.args.map((v) => String(v)),
+      ...(rec.v === 2 ? { v: 2 as const } : {}),
     }
   }
 
@@ -2021,7 +2012,7 @@ function normalizeJobInvocation(raw: unknown): JobInvocation | undefined {
   if (!Array.isArray(raw.args)) return undefined
   const command = raw.command.trim()
   if (!command) return undefined
-  return { command, args: raw.args.map((v) => String(v)) }
+  return { command, args: raw.args.map((v) => String(v)), ...(raw.v === 2 ? { v: 2 as const } : {}) }
 }
 
 function normalizeJobRun(raw: unknown): JobRunSpec | undefined {
@@ -2054,6 +2045,9 @@ function normalizeJobRun(raw: unknown): JobRunSpec | undefined {
   if (typeof raw.port === "number" && Number.isFinite(raw.port)) {
     run.port = raw.port
   }
+
+  if (typeof raw.autoApprove === "boolean") run.autoApprove = raw.autoApprove
+  if (typeof raw.standalone === "boolean") run.standalone = raw.standalone
 
   return run
 }
@@ -2167,65 +2161,11 @@ function getLogPath(job: Job): string {
   return scopedLogPath(scopeId, job.slug)
 }
 
-function buildOpencodeArgs(job: Job): { command: string; args: string[] } {
+function buildOpencodeArgs(job: Job): JobInvocation {
   const command = findOpencode()
   const run = normalizeRunSpec(getJobRun(job))
   validateRunSpec(run)
-
-  const args = ["run"]
-
-  if (run.attachUrl) {
-    args.push("--attach", run.attachUrl)
-  }
-
-  if (run.port !== undefined) {
-    args.push("--port", String(run.port))
-  }
-
-  if (run.command) {
-    args.push("--command", run.command)
-  }
-
-  if (run.agent) {
-    args.push("--agent", run.agent)
-  }
-
-  if (run.model) {
-    args.push("--model", run.model)
-  }
-
-  if (run.variant) {
-    args.push("--variant", run.variant)
-  }
-
-  if (run.runFormat) {
-    args.push("--format", run.runFormat)
-  }
-
-  if (run.share) {
-    args.push("--share")
-  }
-
-  if (run.title) {
-    args.push("--title", run.title)
-  }
-
-  if (run.continue) {
-    args.push("--continue")
-  }
-
-  if (run.session) {
-    args.push("--session", run.session)
-  }
-
-  for (const file of run.files ?? []) {
-    args.push("--file", file)
-  }
-
-  args.push("--")
-  args.push(run.command ? run.arguments ?? "" : run.prompt ?? "")
-
-  return { command, args }
+  return { command, args: buildRunArgs(run), v: 2 }
 }
 
 function buildRunEnvironment(): NodeJS.ProcessEnv {
@@ -2546,7 +2486,7 @@ export const SchedulerPlugin: Plugin = async () => {
              .string()
              .describe("Cron expression: '0 9 * * *' (daily 9am), '0 */6 * * *' (every 6h), '30 8 * * 1' (Monday 8:30am)"),
            prompt: tool.schema.string().optional().describe("Prompt to run (legacy; prefer run fields)"),
-           command: tool.schema.string().optional().describe("Optional: opencode command to run (maps to --command)"),
+           command: tool.schema.string().optional().describe("Optional: opencode command to run (not supported by OpenCode v2; use prompt)"),
            arguments: tool.schema.string().optional().describe("Optional: arguments string for command mode"),
            files: tool.schema
              .string()
@@ -2554,16 +2494,24 @@ export const SchedulerPlugin: Plugin = async () => {
              .describe("Optional: comma-separated list of files/dirs to attach (maps to repeated --file)"),
            agent: tool.schema.string().optional().describe("Optional: agent to use (maps to --agent)"),
            model: tool.schema.string().optional().describe("Optional: model to use (maps to --model)"),
-           variant: tool.schema.string().optional().describe("Optional: model variant (maps to --variant)"),
+           variant: tool.schema.string().optional().describe("Optional: model variant (sent as --model model#variant)"),
            title: tool.schema.string().optional().describe("Optional: session title (maps to --title)"),
-           share: tool.schema.boolean().optional().describe("Optional: share session (maps to --share)"),
+           share: tool.schema.boolean().optional().describe("Optional: share session (not supported by OpenCode v2)"),
            continue: tool.schema.boolean().optional().describe("Optional: continue last session (maps to --continue)"),
            session: tool.schema.string().optional().describe("Optional: session id (maps to --session)"),
            runFormat: tool.schema
              .string()
              .optional()
              .describe("Optional: run output format (maps to opencode --format: default|json)"),
-           port: tool.schema.number().optional().describe("Optional: server port for local server (maps to --port)"),
+           port: tool.schema.number().optional().describe("Optional: server port for local server (not supported by OpenCode v2)"),
+           autoApprove: tool.schema
+             .boolean()
+             .optional()
+             .describe("Optional: auto-approve tool permissions in unattended runs (maps to --auto). Without it, permission requests are rejected."),
+           standalone: tool.schema
+             .boolean()
+             .optional()
+             .describe("Optional: run with a private server instead of the background service (maps to --standalone)."),
            source: tool.schema.string().optional().describe("Optional: source app (e.g. 'marketplace') - used for filtering"),
            workdir: tool.schema
              .string()
@@ -2634,6 +2582,8 @@ export const SchedulerPlugin: Plugin = async () => {
              runFormat,
              attachUrl: args.attachUrl,
              port: args.port,
+             autoApprove: args.autoApprove,
+             standalone: args.standalone,
            }
 
            try {
@@ -2932,7 +2882,7 @@ Commands:
           // Legacy prompt field
           prompt: tool.schema.string().optional().describe("Updated prompt (legacy; prefer command/arguments/etc)"),
 
-          command: tool.schema.string().optional().describe("Updated opencode command (maps to --command)"),
+          command: tool.schema.string().optional().describe("Updated opencode command (not supported by OpenCode v2; use prompt)"),
           arguments: tool.schema.string().optional().describe("Updated command arguments string"),
           files: tool.schema
             .string()
@@ -2940,16 +2890,24 @@ Commands:
             .describe("Updated comma-separated list of files/dirs to attach"),
           agent: tool.schema.string().optional().describe("Updated agent (maps to --agent)"),
           model: tool.schema.string().optional().describe("Updated model (maps to --model)"),
-          variant: tool.schema.string().optional().describe("Updated model variant (maps to --variant)"),
+          variant: tool.schema.string().optional().describe("Updated model variant (sent as --model model#variant)"),
           title: tool.schema.string().optional().describe("Updated session title (maps to --title)"),
-          share: tool.schema.boolean().optional().describe("Updated share flag (maps to --share)"),
+          share: tool.schema.boolean().optional().describe("Updated share flag (not supported by OpenCode v2)"),
           continue: tool.schema.boolean().optional().describe("Updated continue flag (maps to --continue)"),
           session: tool.schema.string().optional().describe("Updated session id (maps to --session)"),
           runFormat: tool.schema
             .string()
             .optional()
             .describe("Updated run output format (default|json)"),
-          port: tool.schema.number().optional().describe("Updated port (maps to --port)"),
+          port: tool.schema.number().optional().describe("Updated port (not supported by OpenCode v2)"),
+          autoApprove: tool.schema
+            .boolean()
+            .optional()
+            .describe("Optional: auto-approve tool permissions in unattended runs (maps to --auto). Without it, permission requests are rejected."),
+          standalone: tool.schema
+            .boolean()
+            .optional()
+            .describe("Optional: run with a private server instead of the background service (maps to --standalone)."),
 
           timeoutSeconds: tool.schema.number().optional().describe("Updated timeout in seconds (0 disables)"),
 
@@ -3002,6 +2960,8 @@ Commands:
             runFormat: args.runFormat !== undefined ? parseRunFormatInput(args.runFormat) : currentRun.runFormat,
             attachUrl: args.attachUrl !== undefined ? args.attachUrl : currentRun.attachUrl,
             port: args.port !== undefined ? args.port : currentRun.port,
+            autoApprove: args.autoApprove !== undefined ? args.autoApprove : currentRun.autoApprove,
+            standalone: args.standalone !== undefined ? args.standalone : currentRun.standalone,
           }
 
           try {
@@ -3189,6 +3149,14 @@ Commands:
           runFormat: tool.schema.string().optional().describe("Override run output format (default|json)"),
           port: tool.schema.number().optional().describe("Override port"),
           attachUrl: tool.schema.string().optional().describe("Override attach URL"),
+          autoApprove: tool.schema
+            .boolean()
+            .optional()
+            .describe("Optional: auto-approve tool permissions in unattended runs (maps to --auto). Without it, permission requests are rejected."),
+          standalone: tool.schema
+            .boolean()
+            .optional()
+            .describe("Optional: run with a private server instead of the background service (maps to --standalone)."),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
         },
         async execute(args) {
@@ -3233,6 +3201,8 @@ Commands:
             runFormat: args.runFormat !== undefined ? parseRunFormatInput(args.runFormat) : baseRun.runFormat,
             port: args.port !== undefined ? args.port : baseRun.port,
             attachUrl: args.attachUrl !== undefined ? args.attachUrl : baseRun.attachUrl,
+            autoApprove: args.autoApprove !== undefined ? args.autoApprove : baseRun.autoApprove,
+            standalone: args.standalone !== undefined ? args.standalone : baseRun.standalone,
           }
 
           let runOverride: JobRunSpec
