@@ -11,13 +11,15 @@
  * - Working directory support for MCP configs
  * - Environment variable injection (PATH for node/npx)
  */
-import type { Plugin } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin"
+import { tool, type ToolSpec } from "./v2-tool"
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
 import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
+import { buildRunArgs, unsupportedV2Fields, type JobRunSpec, type OpencodeRunFormat } from "./run-args"
+import { SUPERVISOR_SCRIPT } from "./supervisor"
+import { classifyJob, stripDroppableV1Fields } from "./migrate"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -120,244 +122,18 @@ function scopedLogPath(scopeId: string, slug: string): string {
   return join(scopeLogsDir(scopeId), `${slug}.log`)
 }
 
-function currentScopeId(): string {
-  return deriveScopeId(process.cwd())
-}
-
-const SUPERVISOR_SCRIPT = `#!/usr/bin/perl
-use strict;
-use warnings;
-use JSON::PP;
-use File::Basename qw(dirname);
-use File::Path qw(make_path);
-use POSIX qw(setsid strftime);
-use Time::HiRes qw(time);
-
-# opencode-scheduler supervisor v1
-
-sub iso_now {
-  my @t = localtime(time());
-  return strftime("%Y-%m-%dT%H:%M:%S%z", @t);
-}
-
-sub read_json {
-  my ($path) = @_;
-  open my $fh, "<", $path or die "Failed to read $path: $!\n";
-  local $/;
-  my $raw = <$fh>;
-  close $fh;
-  my $json = JSON::PP->new->utf8->relaxed;
-  return $json->decode($raw);
-}
-
-sub write_json_atomic {
-  my ($path, $data) = @_;
-  my $tmp = "$path.tmp.$$";
-  my $json = JSON::PP->new->utf8->canonical;
-  open my $fh, ">", $tmp or die "Failed to write $tmp: $!\n";
-  print $fh $json->encode($data);
-  close $fh or die "Failed to close $tmp: $!\n";
-  rename $tmp, $path or die "Failed to rename $tmp -> $path: $!\n";
-}
-
-sub append_jsonl {
-  my ($path, $data) = @_;
-  my $json = JSON::PP->new->utf8->canonical;
-  open my $fh, ">>", $path or die "Failed to append $path: $!\n";
-  print $fh $json->encode($data) . "\n";
-  close $fh;
-}
-
-sub pid_alive {
-  my ($pid) = @_;
-  return 0 if !$pid;
-  return kill 0, $pid;
-}
-
-sub random_id {
-  my $n = int(rand(1_000_000_000));
-  return sprintf("%09d", $n);
-}
-
-my $job_path = shift @ARGV;
-if (!$job_path) { die "usage: supervisor.pl <job.json>\n"; }
-
-my $job = read_json($job_path);
-my $scope_id = $job->{scopeId} || "";
-my $slug = $job->{slug} || "";
-if (!$scope_id || !$slug) { die "job missing scopeId/slug\n"; }
-
-my $home = $ENV{HOME} || "";
-if (!$home) { die "HOME is not set\n"; }
-
-my $config_root = "$home/.config/opencode";
-my $scheduler_root = "$config_root/scheduler/scopes/$scope_id";
-my $locks_dir = "$scheduler_root/locks";
-my $runs_dir = "$scheduler_root/runs";
-my $logs_dir = "$config_root/logs/scheduler/$scope_id";
-
-make_path($locks_dir);
-make_path($runs_dir);
-make_path($logs_dir);
-
-my $log_path = "$logs_dir/$slug.log";
-open STDOUT, ">>", $log_path or die "Failed to open log $log_path: $!\n";
-open STDERR, ">&STDOUT" or die "Failed to dup stderr: $!\n";
-select STDOUT; $| = 1;
-select STDERR; $| = 1;
-
-my $lock_path = "$locks_dir/$slug.json";
-if (-e $lock_path) {
-  my $lock = eval { read_json($lock_path) };
-  my $pid = ($lock && ref($lock) eq 'HASH') ? ($lock->{pid} || 0) : 0;
-  if (pid_alive($pid)) {
-    my $now = iso_now();
-    print "\n=== Scheduled run skipped (already running pid=$pid) $now ===\n";
-    exit 0;
-  }
-  unlink $lock_path;
-}
-
-my $run_id = time() . "-" . random_id();
-my $started_at = iso_now();
-my $t0 = time();
-
-write_json_atomic($lock_path, { pid => $$, startedAt => $started_at, runId => $run_id });
-
-# Update job metadata: running
-$job->{lastRunAt} = $started_at;
-$job->{lastRunSource} = "scheduled";
-$job->{lastRunStatus} = "running";
-delete $job->{lastRunExitCode};
-delete $job->{lastRunError};
-$job->{updatedAt} = $started_at;
-write_json_atomic($job_path, $job);
-
-# Force non-interactive scheduled runs
-my $perm = { question => "deny" };
-if ($ENV{OPENCODE_PERMISSION}) {
-  my $existing = eval { JSON::PP->new->decode($ENV{OPENCODE_PERMISSION}) };
-  if ($existing && ref($existing) eq 'HASH') {
-    $perm = { %$existing, %$perm };
-  }
-}
-$ENV{OPENCODE_PERMISSION} = JSON::PP->new->canonical->encode($perm);
-$ENV{OPENCODE_SCHEDULER_RUN_ID} = $run_id;
-
-print "\n=== Scheduled run $started_at runId=$run_id ===\n";
-
-my $inv = $job->{invocation};
-if (!$inv || ref($inv) ne 'HASH' || !$inv->{command} || ref($inv->{args}) ne 'ARRAY') {
-  my $now = iso_now();
-  print "\n=== Supervisor error $now: job missing invocation.command/args ===\n";
-  $job->{lastRunStatus} = "failed";
-  $job->{lastRunError} = "job missing invocation";
-  $job->{updatedAt} = $now;
-  write_json_atomic($job_path, $job);
-  unlink $lock_path;
-  exit 1;
-}
-
-my $command = $inv->{command};
-my @args = @{ $inv->{args} };
-
-my $workdir = $job->{workdir} || $home;
-
-my $timeout = $job->{timeoutSeconds};
-$timeout = undef if defined($timeout) && $timeout !~ /^\\d+$/;
-
-my $timed_out = 0;
-my $child_pid = fork();
-if (!defined $child_pid) {
-  my $now = iso_now();
-  print "\n=== Supervisor error $now: fork failed: $! ===\n";
-  $job->{lastRunStatus} = "failed";
-  $job->{lastRunError} = "fork failed";
-  $job->{updatedAt} = $now;
-  write_json_atomic($job_path, $job);
-  unlink $lock_path;
-  exit 1;
-}
-
-if ($child_pid == 0) {
-  chdir $workdir or die "Failed to chdir to $workdir: $!\n";
-  eval { setsid(); };
-  exec { $command } $command, @args;
-  die "Failed to exec $command: $!\n";
-}
-
-if (defined($timeout) && $timeout > 0) {
-  local $SIG{ALRM} = sub {
-    $timed_out = 1;
-    my $now = iso_now();
-    print "\n=== Timeout after $timeout seconds $now; sending SIGTERM ===\n";
-    kill 'TERM', -$child_pid;
-    sleep 5;
-    print "\n=== Forcing SIGKILL $now ===\n";
-    kill 'KILL', -$child_pid;
-  };
-  alarm($timeout);
-}
-
-my $waited = waitpid($child_pid, 0);
-my $status = $?;
-alarm(0);
-
-my $finished_at = iso_now();
-my $duration_ms = int((time() - $t0) * 1000);
-my $exit_code = ($status >> 8);
-if ($timed_out) {
-  $exit_code = 124;
-}
-
-my $final_status = "failed";
-my $final_error = undef;
-if ($timed_out) {
-  $final_status = "failed";
-  $final_error = "timeout";
-} elsif ($waited != $child_pid) {
-  $final_status = "failed";
-  $final_error = "waitpid failed";
-} elsif ($status == 0) {
-  $final_status = "success";
-} else {
-  $final_status = "failed";
-  $final_error = "exit code $exit_code";
-}
-
-$job->{lastRunStatus} = $final_status;
-$job->{lastRunExitCode} = $exit_code;
-$job->{lastRunError} = $final_error if defined $final_error;
-$job->{updatedAt} = $finished_at;
-write_json_atomic($job_path, $job);
-
-append_jsonl("$runs_dir/$slug.jsonl", {
-  runId => $run_id,
-  scopeId => $scope_id,
-  slug => $slug,
-  startedAt => $started_at,
-  finishedAt => $finished_at,
-  durationMs => $duration_ms,
-  status => $final_status,
-  exitCode => $exit_code,
-  error => $final_error,
-  pid => $child_pid,
-  logPath => $log_path,
-});
-
-unlink $lock_path;
-print "\n=== Finished $finished_at status=$final_status exitCode=$exit_code durationMs=$duration_ms ===\n";
-exit($exit_code);
-`
-
-function ensureSupervisorScript(): void {
+export function ensureSupervisorScript(): void {
   ensureDir(SCHEDULER_DIR)
   writeFileSync(SUPERVISOR_PATH, SUPERVISOR_SCRIPT)
 }
 
-// Job type
+/** Test-only view of storage paths (computed from homedir() at module load). */
+export const __testing = {
+  paths: () => ({ scopesDir: SCOPES_DIR, legacyJobsDir: LEGACY_JOBS_DIR, supervisorPath: SUPERVISOR_PATH }),
+  deriveScopeId: (workdir: string) => deriveScopeId(workdir),
+}
 
-type OpencodeRunFormat = "default" | "json"
+// Job type
 
 type SchedulerEnvConfig = {
   preserve?: string[]
@@ -369,28 +145,11 @@ type SchedulerConfig = {
   env?: SchedulerEnvConfig
 }
 
-interface JobRunSpec {
-  prompt?: string
-  command?: string
-  arguments?: string
-
-  files?: string[]
-  agent?: string
-  model?: string
-  variant?: string
-  title?: string
-  share?: boolean
-  continue?: boolean
-  session?: string
-  runFormat?: OpencodeRunFormat
-
-  attachUrl?: string
-  port?: number
-}
-
 type JobInvocation = {
   command: string
   args: string[]
+  /** 2 = built for OpenCode v2 `run` flags. Missing = v1 snapshot that needs migrate_jobs. */
+  v?: 2
 }
 
 interface Job {
@@ -464,7 +223,7 @@ interface BuiltinSkill {
 const SCHEDULED_JOB_BEST_PRACTICES_SKILL: BuiltinSkill = {
   name: "scheduled-job-best-practices",
   description: "Patterns for resilient, non-interactive scheduled opencode jobs",
-  suggestedPath: ".opencode/skill/scheduled-job-best-practices/SKILL.md",
+  suggestedPath: ".opencode/skills/scheduled-job-best-practices/SKILL.md",
   files: {
     "SKILL.md": `---
 name: scheduled-job-best-practices
@@ -486,6 +245,12 @@ Then write your task below it.
 3. **Idempotent.** Make reruns safe (maintain a seen/state file; avoid duplicate messages).
 4. **Observable.** Print a short summary at the end with status + outputs.
 5. **Minimal side effects.** Write durable artifacts under outputs/ in the job workdir.
+
+## Permissions In Unattended Runs (OpenCode v2)
+
+Nobody is watching a scheduled run, so OpenCode v2 **rejects every permission request** (file edits, bash, web fetch, ...) unless the job was scheduled with \`autoApprove: true\` (maps to \`opencode run --auto\`). A job that needs a tool which asks for permission will fail or stop early without it. Only set it for prompts you trust to run unsupervised.
+
+By default a run uses the shared OpenCode background service. Set \`standalone: true\` (maps to \`--standalone\`) to give each run its own private server instead, e.g. when the background service is not running at schedule time. \`attachUrl\` (maps to \`--server\`) targets a specific running server and takes precedence over \`standalone\`.
 
 ## Runtime Values: Dates
 
@@ -814,7 +579,7 @@ function formatSystemdValue(value: number, size: number): string {
   return value.toString().padStart(size, "0")
 }
 
-function cronToSystemdCalendars(cron: string): string[] {
+export function cronToSystemdCalendars(cron: string): string[] {
   const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron)
   const minuteValues = parseCronField(minute, 0, 59, "minute")
   const hourValues = parseCronField(hour, 0, 23, "hour")
@@ -838,7 +603,8 @@ function cronToSystemdCalendars(cron: string): string[] {
         for (const domValue of domValues) {
           for (const monthValue of months) {
             for (const dowValue of dowValues) {
-              calendars.push(`${dowValue} *-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`)
+              const dowPrefix = dowValue === "*" ? "" : `${dowValue} `
+              calendars.push(`${dowPrefix}*-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`)
             }
           }
         }
@@ -1227,8 +993,12 @@ function uninstallSystemdJob(job: Job): void {
   const legacyTimerUnit = `opencode-job-${job.slug}.timer`
 
   for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
+    // Separate attempts: a failed/never-started timer can make `stop` fail, and skipping
+    // `disable` would leave a dangling timers.target.wants symlink after the files are removed.
     try {
       execSync(`systemctl --user stop ${timerUnit}`, { stdio: "ignore" })
+    } catch {}
+    try {
       execSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" })
     } catch {}
   }
@@ -1467,6 +1237,10 @@ function installJob(job: Job): SchedulerBackend {
       if (!isCronAvailable()) {
         throw error
       }
+      // Don't leave a half-installed (enabled but unstartable) timer behind the cron fallback.
+      try {
+        uninstallSystemdJob(job)
+      } catch {}
       installCronJob(job)
       return "cron"
     }
@@ -1905,10 +1679,18 @@ function normalizeRunSpec(run: JobRunSpec): JobRunSpec {
     normalized.port = undefined
   }
 
+  if (normalized.autoApprove !== true) normalized.autoApprove = undefined
+  if (normalized.standalone !== true) normalized.standalone = undefined
+
   return normalized
 }
 
-function validateRunSpec(run: JobRunSpec): void {
+/**
+ * `v2: false` skips the OpenCode v2 flag check. Use it only when LOADING saved jobs, so
+ * v1 jobs (port/share/command/variant-without-model) stay visible to list/get/migrate.
+ * Anything that BUILDS a new run spec or invocation must keep the default (`v2: true`).
+ */
+function validateRunSpec(run: JobRunSpec, options: { v2?: boolean } = {}): void {
   const hasPrompt = typeof run.prompt === "string" && run.prompt.trim().length > 0
   const hasCommand = typeof run.command === "string" && run.command.trim().length > 0
 
@@ -1936,6 +1718,11 @@ function validateRunSpec(run: JobRunSpec): void {
 
   if (run.runFormat !== undefined && run.runFormat !== "default" && run.runFormat !== "json") {
     throw new Error("run.runFormat must be 'default' or 'json'")
+  }
+
+  const v2Issues = options.v2 === false ? [] : unsupportedV2Fields(run)
+  if (v2Issues.length) {
+    throw new Error(v2Issues.join("; "))
   }
 }
 
@@ -1994,12 +1781,14 @@ function sanitizeJob(job: Job): Job {
     sanitized.invocation = {
       command: rec.command,
       args: rec.args.map((v) => String(v)),
+      ...(rec.v === 2 ? { v: 2 as const } : {}),
     }
   }
 
   if (sanitized.run) {
     const normalized = normalizeRunSpec(sanitized.run)
-    validateRunSpec(normalized)
+    // Saved jobs may still carry v1-only fields; migrate_jobs classifies them.
+    validateRunSpec(normalized, { v2: false })
     sanitized.run = normalized
   }
 
@@ -2021,7 +1810,7 @@ function normalizeJobInvocation(raw: unknown): JobInvocation | undefined {
   if (!Array.isArray(raw.args)) return undefined
   const command = raw.command.trim()
   if (!command) return undefined
-  return { command, args: raw.args.map((v) => String(v)) }
+  return { command, args: raw.args.map((v) => String(v)), ...(raw.v === 2 ? { v: 2 as const } : {}) }
 }
 
 function normalizeJobRun(raw: unknown): JobRunSpec | undefined {
@@ -2054,6 +1843,9 @@ function normalizeJobRun(raw: unknown): JobRunSpec | undefined {
   if (typeof raw.port === "number" && Number.isFinite(raw.port)) {
     run.port = raw.port
   }
+
+  if (typeof raw.autoApprove === "boolean") run.autoApprove = raw.autoApprove
+  if (typeof raw.standalone === "boolean") run.standalone = raw.standalone
 
   return run
 }
@@ -2100,9 +1892,9 @@ function normalizeJob(raw: unknown): Job | null {
 
 function findJobByName(
   name: string,
-  options?: { scopeId?: string; allScopes?: boolean; includeLegacy?: boolean }
+  scopeId: string,
+  options?: { allScopes?: boolean; includeLegacy?: boolean }
 ): Job | null {
-  const scopeId = options?.scopeId ?? currentScopeId()
   const slug = slugify(name)
 
   let job = loadScopedJob(scopeId, slug) || loadScopedJob(scopeId, name)
@@ -2167,65 +1959,11 @@ function getLogPath(job: Job): string {
   return scopedLogPath(scopeId, job.slug)
 }
 
-function buildOpencodeArgs(job: Job): { command: string; args: string[] } {
+function buildOpencodeArgs(job: Job): JobInvocation {
   const command = findOpencode()
   const run = normalizeRunSpec(getJobRun(job))
   validateRunSpec(run)
-
-  const args = ["run"]
-
-  if (run.attachUrl) {
-    args.push("--attach", run.attachUrl)
-  }
-
-  if (run.port !== undefined) {
-    args.push("--port", String(run.port))
-  }
-
-  if (run.command) {
-    args.push("--command", run.command)
-  }
-
-  if (run.agent) {
-    args.push("--agent", run.agent)
-  }
-
-  if (run.model) {
-    args.push("--model", run.model)
-  }
-
-  if (run.variant) {
-    args.push("--variant", run.variant)
-  }
-
-  if (run.runFormat) {
-    args.push("--format", run.runFormat)
-  }
-
-  if (run.share) {
-    args.push("--share")
-  }
-
-  if (run.title) {
-    args.push("--title", run.title)
-  }
-
-  if (run.continue) {
-    args.push("--continue")
-  }
-
-  if (run.session) {
-    args.push("--session", run.session)
-  }
-
-  for (const file of run.files ?? []) {
-    args.push("--file", file)
-  }
-
-  args.push("--")
-  args.push(run.command ? run.arguments ?? "" : run.prompt ?? "")
-
-  return { command, args }
+  return { command, args: buildRunArgs(run), v: 2 }
 }
 
 function buildRunEnvironment(): NodeJS.ProcessEnv {
@@ -2311,7 +2049,7 @@ function runJobNow(job: Job): { startedAt: string; logPath: string; pid?: number
   try {
     child = spawn(command, args, {
       cwd: workdir,
-      env: buildRunEnvironment(),
+      env: { ...buildRunEnvironment(), PWD: workdir },
       stdio: ["ignore", "pipe", "pipe"],
     })
   } catch (error) {
@@ -2534,9 +2272,23 @@ function getJobLogs(job: Job, options?: { tailLines?: number; maxChars?: number 
 
 // === PLUGIN ===
 
-export const SchedulerPlugin: Plugin = async () => {
+export function builtinSkillsForRegistration(): { id: string; name: string; description: string; content: string }[] {
+  return listBuiltinSkills().map((skill) => ({
+    id: skill.name,
+    name: skill.name,
+    description: skill.description,
+    content: skill.files["SKILL.md"] ?? "",
+  }))
+}
+
+/**
+ * `workdir` is the project this plugin instance serves (v2: ctx.location.directory). It is
+ * captured per call so several project instances in one OpenCode process never share it.
+ */
+export function buildTools(workdir: string): Record<string, ToolSpec> {
+  const defaultWorkdir = workdir
+  const currentScopeId = deriveScopeId(defaultWorkdir)
   return {
-    tool: {
        schedule_job: tool({
            description:
             "Schedule a recurring job to run an opencode prompt. Uses launchd (Mac), systemd (Linux), Windows Task Scheduler, or cron fallback when needed.",
@@ -2546,7 +2298,7 @@ export const SchedulerPlugin: Plugin = async () => {
              .string()
              .describe("Cron expression: '0 9 * * *' (daily 9am), '0 */6 * * *' (every 6h), '30 8 * * 1' (Monday 8:30am)"),
            prompt: tool.schema.string().optional().describe("Prompt to run (legacy; prefer run fields)"),
-           command: tool.schema.string().optional().describe("Optional: opencode command to run (maps to --command)"),
+           command: tool.schema.string().optional().describe("Optional: opencode command to run (not supported by OpenCode v2; use prompt)"),
            arguments: tool.schema.string().optional().describe("Optional: arguments string for command mode"),
            files: tool.schema
              .string()
@@ -2554,16 +2306,24 @@ export const SchedulerPlugin: Plugin = async () => {
              .describe("Optional: comma-separated list of files/dirs to attach (maps to repeated --file)"),
            agent: tool.schema.string().optional().describe("Optional: agent to use (maps to --agent)"),
            model: tool.schema.string().optional().describe("Optional: model to use (maps to --model)"),
-           variant: tool.schema.string().optional().describe("Optional: model variant (maps to --variant)"),
+           variant: tool.schema.string().optional().describe("Optional: model variant (sent as --model model#variant)"),
            title: tool.schema.string().optional().describe("Optional: session title (maps to --title)"),
-           share: tool.schema.boolean().optional().describe("Optional: share session (maps to --share)"),
+           share: tool.schema.boolean().optional().describe("Optional: share session (not supported by OpenCode v2)"),
            continue: tool.schema.boolean().optional().describe("Optional: continue last session (maps to --continue)"),
            session: tool.schema.string().optional().describe("Optional: session id (maps to --session)"),
            runFormat: tool.schema
              .string()
              .optional()
              .describe("Optional: run output format (maps to opencode --format: default|json)"),
-           port: tool.schema.number().optional().describe("Optional: server port for local server (maps to --port)"),
+           port: tool.schema.number().optional().describe("Optional: server port for local server (not supported by OpenCode v2)"),
+           autoApprove: tool.schema
+             .boolean()
+             .optional()
+             .describe("Optional: auto-approve tool permissions in unattended runs (maps to --auto). Without it, permission requests are rejected."),
+           standalone: tool.schema
+             .boolean()
+             .optional()
+             .describe("Optional: run with a private server instead of the background service (maps to --standalone)."),
            source: tool.schema.string().optional().describe("Optional: source app (e.g. 'marketplace') - used for filtering"),
            workdir: tool.schema
              .string()
@@ -2584,7 +2344,7 @@ export const SchedulerPlugin: Plugin = async () => {
             const format = normalizeFormat(args.format)
             const slug = args.source ? `${args.source}-${slugify(args.name)}` : slugify(args.name)
 
-            const workdir = normalizeWorkdirPath(args.workdir || process.cwd())
+            const workdir = normalizeWorkdirPath(args.workdir || defaultWorkdir)
             const scopeId = deriveScopeId(workdir)
 
             if (loadScopedJob(scopeId, slug)) {
@@ -2634,6 +2394,8 @@ export const SchedulerPlugin: Plugin = async () => {
              runFormat,
              attachUrl: args.attachUrl,
              port: args.port,
+             autoApprove: args.autoApprove,
+             standalone: args.standalone,
            }
 
            try {
@@ -2743,7 +2505,7 @@ Commands:
 
           const scopeId = args.allScopes
             ? undefined
-            : deriveScopeId(normalizeWorkdirPath(args.scopeRoot || process.cwd()))
+            : deriveScopeId(normalizeWorkdirPath(args.scopeRoot || defaultWorkdir))
 
           let jobs = args.allScopes ? loadAllJobsAcrossScopes() : loadAllScopedJobs(scopeId!)
 
@@ -2778,13 +2540,14 @@ Commands:
             const trimmed = preview.trim()
             const snippet = trimmed.slice(0, 50) + (trimmed.length > 50 ? "..." : "")
 
-            return `${i + 1}. ${j.name} (${j.slug})
+            const migrate = classifyJob(j).status !== "current" ? " (needs migrate_jobs)" : ""
+            return `${i + 1}. ${j.name} (${j.slug})${migrate}
    ${describeCron(j.schedule)}
    ${snippet}`
           })
 
-
-          return okResult(format, `Scheduled Jobs\n\n${lines.join("\n\n")}`, { jobs })
+          const data = jobs.map((j) => ({ ...j, needsMigration: classifyJob(j).status !== "current" }))
+          return okResult(format, `Scheduled Jobs\n\n${lines.join("\n\n")}`, { jobs: data })
         },
       }),
 
@@ -2853,7 +2616,7 @@ Commands:
       }),
 
       install_skill: tool({
-        description: "Install a built-in skill into your repo's .opencode/skill directory.",
+        description: "Install a built-in skill into your repo's .opencode/skills directory.",
         args: {
           name: tool.schema
             .string()
@@ -2879,7 +2642,7 @@ Commands:
             return errorResult(format, `No built-in skill found for ${label}. Available: ${available || "(none)"}`)
           }
 
-          const directory = args.directory ?? process.cwd()
+          const directory = args.directory ?? defaultWorkdir
           const overwrite = args.overwrite === true
 
           try {
@@ -2913,7 +2676,7 @@ Commands:
         },
         async execute(args) {
           const format = normalizeFormat(args.format)
-          const job = findJobByName(args.name)
+          const job = findJobByName(args.name, currentScopeId)
 
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found.`)
@@ -2932,7 +2695,7 @@ Commands:
           // Legacy prompt field
           prompt: tool.schema.string().optional().describe("Updated prompt (legacy; prefer command/arguments/etc)"),
 
-          command: tool.schema.string().optional().describe("Updated opencode command (maps to --command)"),
+          command: tool.schema.string().optional().describe("Updated opencode command (not supported by OpenCode v2; use prompt)"),
           arguments: tool.schema.string().optional().describe("Updated command arguments string"),
           files: tool.schema
             .string()
@@ -2940,16 +2703,24 @@ Commands:
             .describe("Updated comma-separated list of files/dirs to attach"),
           agent: tool.schema.string().optional().describe("Updated agent (maps to --agent)"),
           model: tool.schema.string().optional().describe("Updated model (maps to --model)"),
-          variant: tool.schema.string().optional().describe("Updated model variant (maps to --variant)"),
+          variant: tool.schema.string().optional().describe("Updated model variant (sent as --model model#variant)"),
           title: tool.schema.string().optional().describe("Updated session title (maps to --title)"),
-          share: tool.schema.boolean().optional().describe("Updated share flag (maps to --share)"),
+          share: tool.schema.boolean().optional().describe("Updated share flag (not supported by OpenCode v2)"),
           continue: tool.schema.boolean().optional().describe("Updated continue flag (maps to --continue)"),
           session: tool.schema.string().optional().describe("Updated session id (maps to --session)"),
           runFormat: tool.schema
             .string()
             .optional()
             .describe("Updated run output format (default|json)"),
-          port: tool.schema.number().optional().describe("Updated port (maps to --port)"),
+          port: tool.schema.number().optional().describe("Updated port (not supported by OpenCode v2)"),
+          autoApprove: tool.schema
+            .boolean()
+            .optional()
+            .describe("Optional: auto-approve tool permissions in unattended runs (maps to --auto). Without it, permission requests are rejected."),
+          standalone: tool.schema
+            .boolean()
+            .optional()
+            .describe("Optional: run with a private server instead of the background service (maps to --standalone)."),
 
           timeoutSeconds: tool.schema.number().optional().describe("Updated timeout in seconds (0 disables)"),
 
@@ -2959,7 +2730,7 @@ Commands:
         },
         async execute(args) {
           const format = normalizeFormat(args.format)
-          const job = findJobByName(args.name)
+          const job = findJobByName(args.name, currentScopeId)
 
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found.`)
@@ -3002,6 +2773,8 @@ Commands:
             runFormat: args.runFormat !== undefined ? parseRunFormatInput(args.runFormat) : currentRun.runFormat,
             attachUrl: args.attachUrl !== undefined ? args.attachUrl : currentRun.attachUrl,
             port: args.port !== undefined ? args.port : currentRun.port,
+            autoApprove: args.autoApprove !== undefined ? args.autoApprove : currentRun.autoApprove,
+            standalone: args.standalone !== undefined ? args.standalone : currentRun.standalone,
           }
 
           try {
@@ -3115,7 +2888,7 @@ Commands:
         },
         async execute(args) {
           const format = normalizeFormat(args.format)
-          const job = findJobByName(args.name)
+          const job = findJobByName(args.name, currentScopeId)
 
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found.`)
@@ -3170,6 +2943,55 @@ Commands:
         },
       }),
 
+      migrate_jobs: tool({
+        description:
+          "Rebuild saved command lines of jobs created for OpenCode v1 so they run on OpenCode v2. Dry run by default; pass confirm=true to apply. Jobs that need a manual edit are listed, not changed.",
+        args: {
+          confirm: tool.schema.boolean().optional().describe("Apply the changes (default false = dry run)."),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format)
+          const jobs = [...loadAllJobsAcrossScopes(), ...loadAllLegacyJobs()]
+          const items = jobs.map((job) => ({ job, item: classifyJob(job) }))
+          const lines: string[] = []
+          const errors: { scopeId?: string; slug: string; error: string }[] = []
+          let applied = 0
+          if (args.confirm === true) {
+            // Migrated jobs rely on the v2 supervisor (sets PWD for the run); refresh the on-disk copy.
+            ensureSupervisorScript()
+          }
+          for (const { job, item } of items) {
+            if (item.status === "current") continue
+            lines.push(`${item.status.toUpperCase()} ${item.scopeId ?? "legacy"}/${item.slug}: ${item.reasons.join("; ")}`)
+            if (!job.scopeId) {
+              // Legacy (pre-scope) jobs live outside scope storage; saving would move them. Report only.
+              lines.push(`  legacy job: delete it and re-create it with schedule_job`)
+              continue
+            }
+            if (args.confirm === true && item.status === "rebuild") {
+              // One bad job must not abort the run after earlier jobs were already saved.
+              try {
+                const updated: Job = { ...job, run: stripDroppableV1Fields(getJobRun(job)) }
+                updated.invocation = buildOpencodeArgs(updated)
+                updated.updatedAt = new Date().toISOString()
+                saveJob(updated)
+                // launchd/systemd/cron read the job JSON through the supervisor; Windows embeds the command in the task.
+                if (IS_WINDOWS) installJob(updated)
+                applied++
+              } catch (error) {
+                const msg = error instanceof Error ? error.message : String(error)
+                errors.push({ scopeId: job.scopeId, slug: job.slug, error: msg })
+                lines.push(`ERROR ${job.scopeId}/${job.slug}: ${msg}`)
+              }
+            }
+          }
+          if (!lines.length) return okResult(format, "All jobs already use OpenCode v2 command lines.", { items: [] })
+          const header = args.confirm === true ? `Applied ${applied} rebuild(s)${errors.length ? `, ${errors.length} error(s)` : ""}.` : "Dry run (pass confirm=true to apply):"
+          return okResult(format, `${header}\n${lines.join("\n")}`, { items: items.map((x) => x.item), applied, errors })
+        },
+      }),
+
       run_job: tool({
         description: "Run a scheduled job immediately",
         args: {
@@ -3189,11 +3011,19 @@ Commands:
           runFormat: tool.schema.string().optional().describe("Override run output format (default|json)"),
           port: tool.schema.number().optional().describe("Override port"),
           attachUrl: tool.schema.string().optional().describe("Override attach URL"),
+          autoApprove: tool.schema
+            .boolean()
+            .optional()
+            .describe("Optional: auto-approve tool permissions in unattended runs (maps to --auto). Without it, permission requests are rejected."),
+          standalone: tool.schema
+            .boolean()
+            .optional()
+            .describe("Optional: run with a private server instead of the background service (maps to --standalone)."),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
         },
         async execute(args) {
           const format = normalizeFormat(args.format)
-          const job = findJobByName(args.name)
+          const job = findJobByName(args.name, currentScopeId)
 
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found. Use list_jobs to see available jobs.`)
@@ -3233,6 +3063,8 @@ Commands:
             runFormat: args.runFormat !== undefined ? parseRunFormatInput(args.runFormat) : baseRun.runFormat,
             port: args.port !== undefined ? args.port : baseRun.port,
             attachUrl: args.attachUrl !== undefined ? args.attachUrl : baseRun.attachUrl,
+            autoApprove: args.autoApprove !== undefined ? args.autoApprove : baseRun.autoApprove,
+            standalone: args.standalone !== undefined ? args.standalone : baseRun.standalone,
           }
 
           let runOverride: JobRunSpec
@@ -3286,7 +3118,7 @@ Commands:
         },
         async execute(args) {
           const format = normalizeFormat(args.format)
-          const job = findJobByName(args.name)
+          const job = findJobByName(args.name, currentScopeId)
 
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found.`)
@@ -3307,9 +3139,5 @@ Commands:
           return okResult(format, `Logs for ${job.name}\n\n${logs}`, { job, logPath, logs })
         },
       }),
-    },
   }
 }
-
-// Default export for OpenCode plugin system
-export default SchedulerPlugin
