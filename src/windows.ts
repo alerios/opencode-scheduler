@@ -10,15 +10,17 @@ import { win32 } from "path"
 export const WINDOWS_TR_MAX = 261
 
 export const WINDOWS_OPENCODE_NOT_FOUND =
-  "Could not find opencode.exe (not on PATH via where.exe, not the current process, and not in " +
+  "Could not find opencode.exe (not in a PATH folder, not the current process, and not in " +
   "%USERPROFILE%\\.opencode\\bin or %LOCALAPPDATA%\\Programs\\opencode). Scheduled tasks need an absolute path: " +
   "set OPENCODE_SCHEDULER_OPENCODE_PATH to the full path of opencode.exe and try again."
 
 export interface WindowsOpencodeProbe {
   /** OPENCODE_SCHEDULER_OPENCODE_PATH */
   override?: string
-  /** stdout of `where.exe opencode`, or null/undefined when it failed */
-  whereOutput?: string | null
+  /** OPENCODE_SCHEDULER_ALLOW_CMD_SHIM=1: accept a .cmd/.bat override (test probes only) */
+  allowCmdShim?: boolean
+  /** %PATH% (";"-separated) */
+  pathEnv?: string
   /** process.execPath */
   execPath?: string
   /** %USERPROFILE% */
@@ -28,26 +30,48 @@ export interface WindowsOpencodeProbe {
   exists: (path: string) => boolean
 }
 
+/** Drive-absolute (C:\x) or UNC (\\server\share). path.win32.isAbsolute also accepts "\x" (current drive). */
+export function isWindowsAbsolutePath(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(value) || /^[\\/]{2}[^\\/]/.test(value)
+}
+
 /**
  * Resolve an absolute opencode path for a Windows scheduled task.
  * Returns null when nothing is found (callers must fail clearly, not store a bare name:
  * Task Scheduler does not resolve a bare `opencode` the way an interactive shell does).
+ * Throws when OPENCODE_SCHEDULER_OPENCODE_PATH is set but unusable.
  */
 export function resolveWindowsOpencode(probe: WindowsOpencodeProbe): string | null {
   const override = probe.override?.trim()
-  if (override) return override
+  if (override) {
+    if (!isWindowsAbsolutePath(override)) {
+      throw new Error(`OPENCODE_SCHEDULER_OPENCODE_PATH must be an absolute path to opencode.exe (got "${override}").`)
+    }
+    if (!probe.exists(override)) {
+      throw new Error(`OPENCODE_SCHEDULER_OPENCODE_PATH points to a file that does not exist: ${override}`)
+    }
+    if (/\.(cmd|bat)$/i.test(override) && !probe.allowCmdShim) {
+      throw new Error(
+        `OPENCODE_SCHEDULER_OPENCODE_PATH points to a .cmd/.bat file (${override}); cmd.exe would re-parse the prompt ` +
+          "arguments (%VAR%, quotes, &). Point it at opencode.exe, or set OPENCODE_SCHEDULER_ALLOW_CMD_SHIM=1 for test probes.",
+      )
+    }
+    return override
+  }
 
-  // where.exe lists PATHEXT matches in PATH order. Take the first real .exe: an npm
-  // `opencode.cmd` shim would run through cmd.exe, which re-parses the prompt argument.
-  const whereLines = (probe.whereOutput ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-  const whereExe = whereLines.find((line) => /\.exe$/i.test(line))
-  if (whereExe) return whereExe
+  // Scan PATH ourselves instead of where.exe: where.exe searches the current directory first
+  // (a planted opencode.exe in a project root would be baked into the task) and prints in the
+  // OEM code page. Only absolute folders and only opencode.exe: an npm `opencode.cmd` shim
+  // would run through cmd.exe, which re-parses the prompt argument.
+  for (const raw of (probe.pathEnv ?? "").split(";")) {
+    const dir = raw.trim().replace(/^"(.*)"$/, "$1").trim()
+    if (!dir || !isWindowsAbsolutePath(dir)) continue
+    const candidate = win32.join(dir, "opencode.exe")
+    if (probe.exists(candidate)) return candidate
+  }
 
   // Inside the OpenCode v2 service the plugin runs in opencode.exe itself.
-  if (probe.execPath) {
+  if (probe.execPath && isWindowsAbsolutePath(probe.execPath) && probe.exists(probe.execPath)) {
     const base = win32.basename(probe.execPath).toLowerCase()
     if (base === "opencode.exe" || base === "opencode") return probe.execPath
   }
@@ -56,9 +80,28 @@ export function resolveWindowsOpencode(probe: WindowsOpencodeProbe): string | nu
   if (probe.userProfile) fallbacks.push(win32.join(probe.userProfile, ".opencode", "bin", "opencode.exe"))
   if (probe.localAppData) fallbacks.push(win32.join(probe.localAppData, "Programs", "opencode", "opencode.exe"))
   for (const candidate of fallbacks) {
-    if (probe.exists(candidate)) return candidate
+    if (isWindowsAbsolutePath(candidate) && probe.exists(candidate)) return candidate
   }
   return null
+}
+
+/** System tools by absolute path, so a planted schtasks.exe/powershell.exe in the cwd or PATH is never run. */
+export function windowsSystemBinaries(systemRoot: string | undefined): { schtasks: string; powershell: string } {
+  const root = systemRoot && isWindowsAbsolutePath(systemRoot) ? systemRoot : "C:\\Windows"
+  return {
+    schtasks: win32.join(root, "System32", "schtasks.exe"),
+    powershell: win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+  }
+}
+
+/** Short error text for a failed execFileSync: stderr, never the command line (which may hold a base64 script). */
+export function summarizeExecError(error: unknown): string {
+  const record = (error ?? {}) as { stderr?: unknown; status?: unknown; message?: unknown }
+  const stderr = record.stderr == null ? "" : String(record.stderr).trim()
+  if (stderr) return stderr.length > 1000 ? `${stderr.slice(0, 997)}...` : stderr
+  if (typeof record.status === "number") return `exit code ${record.status}`
+  const message = typeof record.message === "string" ? record.message : String(error)
+  return message.split(/\r?\n/)[0].slice(0, 300)
 }
 
 export interface WindowsSupervisorAction {
@@ -96,7 +139,8 @@ export function splitWindowsTaskName(fullName: string): { path: string; name: st
 }
 
 function psQuote(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`
+  // PowerShell also treats the typographic quotes U+2018..U+201B as single quotes.
+  return `'${value.replace(/['\u2018\u2019\u201A\u201B]/g, "$&$&")}'`
 }
 
 /**
@@ -118,6 +162,8 @@ export function buildWindowsTaskConfigureScript(taskNames: string[], action: Win
     "  $settings.DisallowStartIfOnBatteries = $false",
     "  $settings.StopIfGoingOnBatteries = $false",
     "  $settings.StartWhenAvailable = $true",
+    // supervisor.ps1 enforces timeoutSeconds; the default PT72H limit would kill only powershell.exe and orphan opencode.
+    "  $settings.ExecutionTimeLimit = 'PT0S'",
     `  Set-ScheduledTask -TaskPath ${psQuote(folder)} -TaskName $name -Action $action -Settings $settings | Out-Null`,
     "}",
   ].join("\n")

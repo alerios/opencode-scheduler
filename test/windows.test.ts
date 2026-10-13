@@ -7,6 +7,8 @@ import {
   buildWindowsTaskConfigureScript,
   resolveWindowsOpencode,
   splitWindowsTaskName,
+  summarizeExecError,
+  windowsSystemBinaries,
   windowsTaskRunValue,
 } from "../src/windows"
 import { WINDOWS_SUPERVISOR_SCRIPT } from "../src/supervisor-windows"
@@ -15,38 +17,58 @@ import * as index from "../src/index"
 const none = () => false
 
 describe("resolveWindowsOpencode", () => {
-  test("override wins, returned as-is (existing semantics)", () => {
+  test("override: absolute existing path is used", () => {
     expect(
-      resolveWindowsOpencode({ override: "  D:\\tools\\opencode.cmd ", whereOutput: "C:\\a\\opencode.exe\r\n", exists: none }),
-    ).toBe("D:\\tools\\opencode.cmd")
+      resolveWindowsOpencode({ override: "  D:\\tools\\opencode.exe ", pathEnv: "C:\\a", exists: (p) => p === "D:\\tools\\opencode.exe" }),
+    ).toBe("D:\\tools\\opencode.exe")
   })
 
-  test("where.exe: first .exe line, CRLF output", () => {
-    const whereOutput = "C:\\Users\\Jo Smith\\AppData\\Roaming\\npm\\opencode.cmd\r\nC:\\Program Files\\opencode\\opencode.exe\r\nC:\\other\\opencode.exe\r\n"
-    expect(resolveWindowsOpencode({ whereOutput, exists: none })).toBe("C:\\Program Files\\opencode\\opencode.exe")
+  test("override: relative, bare or missing path is a clear error (not silently used)", () => {
+    for (const override of ["opencode", "bin\\opencode.exe", "\\tools\\opencode.exe"]) {
+      expect(() => resolveWindowsOpencode({ override, exists: () => true })).toThrow(/OPENCODE_SCHEDULER_OPENCODE_PATH.*absolute/)
+    }
+    expect(() => resolveWindowsOpencode({ override: "D:\\nope\\opencode.exe", exists: none })).toThrow(/OPENCODE_SCHEDULER_OPENCODE_PATH.*does not exist/)
   })
 
-  test("where.exe output with only non-.exe shims falls through to execPath", () => {
-    expect(
-      resolveWindowsOpencode({
-        whereOutput: "C:\\npm\\opencode.cmd\r\n",
-        execPath: "C:\\Users\\winvm\\Downloads\\opencode.exe",
-        exists: none,
-      }),
-    ).toBe("C:\\Users\\winvm\\Downloads\\opencode.exe")
+  test("override: .cmd/.bat refused unless OPENCODE_SCHEDULER_ALLOW_CMD_SHIM", () => {
+    const exists = () => true
+    expect(() => resolveWindowsOpencode({ override: "C:\\probe\\probe.cmd", exists })).toThrow(/OPENCODE_SCHEDULER_ALLOW_CMD_SHIM/)
+    expect(() => resolveWindowsOpencode({ override: "C:\\probe\\probe.BAT", exists })).toThrow(/cmd\.exe/)
+    expect(resolveWindowsOpencode({ override: "C:\\probe\\probe.cmd", allowCmdShim: true, exists })).toBe("C:\\probe\\probe.cmd")
   })
 
-  test("execPath used only when its basename is opencode(.exe)", () => {
-    expect(resolveWindowsOpencode({ whereOutput: null, execPath: "C:\\x\\OpenCode.EXE", exists: none })).toBe("C:\\x\\OpenCode.EXE")
-    expect(resolveWindowsOpencode({ whereOutput: null, execPath: "C:\\x\\opencode", exists: none })).toBe("C:\\x\\opencode")
-    expect(resolveWindowsOpencode({ whereOutput: null, execPath: "C:\\bun\\bun.exe", exists: none })).toBeNull()
+  test("PATH scan: absolute dirs only, opencode.exe only, PATH order, quotes stripped", () => {
+    const found = new Set([
+      "C:\\Users\\Jo Smith\\AppData\\Roaming\\npm\\opencode.cmd",
+      "C:\\Program Files\\opencode\\opencode.exe",
+      "C:\\other\\opencode.exe",
+      "proj\\opencode.exe",
+      ".\\opencode.exe",
+    ])
+    const pathEnv = ".;proj;;C:\\Users\\Jo Smith\\AppData\\Roaming\\npm;\"C:\\Program Files\\opencode\";C:\\other"
+    expect(resolveWindowsOpencode({ pathEnv, exists: (p) => found.has(p) })).toBe("C:\\Program Files\\opencode\\opencode.exe")
+  })
+
+  test("PATH scan accepts UNC dirs and non-ASCII profile paths", () => {
+    expect(resolveWindowsOpencode({ pathEnv: "\\\\srv\\tools", exists: (p) => p === "\\\\srv\\tools\\opencode.exe" })).toBe("\\\\srv\\tools\\opencode.exe")
+    const dir = "C:\\Users\\José Müller\\bin"
+    expect(resolveWindowsOpencode({ pathEnv: dir, exists: (p) => p === `${dir}\\opencode.exe` })).toBe(`${dir}\\opencode.exe`)
+  })
+
+  test("execPath used only when absolute, existing and named opencode(.exe)", () => {
+    const yes = () => true
+    expect(resolveWindowsOpencode({ execPath: "C:\\x\\OpenCode.EXE", exists: yes })).toBe("C:\\x\\OpenCode.EXE")
+    expect(resolveWindowsOpencode({ execPath: "C:\\x\\opencode", exists: yes })).toBe("C:\\x\\opencode")
+    expect(resolveWindowsOpencode({ execPath: "C:\\bun\\bun.exe", exists: yes })).toBeNull()
+    expect(resolveWindowsOpencode({ execPath: "x\\opencode.exe", exists: yes })).toBeNull()
+    expect(resolveWindowsOpencode({ execPath: "C:\\x\\opencode.exe", exists: none })).toBeNull()
   })
 
   test("fallbacks: %USERPROFILE%\\.opencode\\bin then %LOCALAPPDATA%\\Programs\\opencode", () => {
     const userBin = "C:\\Users\\winvm\\.opencode\\bin\\opencode.exe"
     const localBin = "C:\\Users\\winvm\\AppData\\Local\\Programs\\opencode\\opencode.exe"
     const base = {
-      whereOutput: "",
+      pathEnv: "",
       execPath: "C:\\bun\\bun.exe",
       userProfile: "C:\\Users\\winvm",
       localAppData: "C:\\Users\\winvm\\AppData\\Local",
@@ -58,6 +80,29 @@ describe("resolveWindowsOpencode", () => {
 
   test("not-found message names OPENCODE_SCHEDULER_OPENCODE_PATH", () => {
     expect(WINDOWS_OPENCODE_NOT_FOUND).toContain("OPENCODE_SCHEDULER_OPENCODE_PATH")
+  })
+})
+
+describe("windows system binaries and exec errors", () => {
+  test("schtasks/powershell by absolute path under %SystemRoot%", () => {
+    expect(windowsSystemBinaries("D:\\Win")).toEqual({
+      schtasks: "D:\\Win\\System32\\schtasks.exe",
+      powershell: "D:\\Win\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    })
+    expect(windowsSystemBinaries(undefined).schtasks).toBe("C:\\Windows\\System32\\schtasks.exe")
+    expect(windowsSystemBinaries("relative").schtasks).toBe("C:\\Windows\\System32\\schtasks.exe")
+  })
+
+  test("summarizeExecError: stderr text, never the command line (no base64 blob)", () => {
+    const err = Object.assign(new Error(`Command failed: powershell.exe -EncodedCommand ${"QQBB".repeat(500)}\nboom`), {
+      status: 1,
+      stderr: Buffer.from("  Set-ScheduledTask : Access is denied.\r\n"),
+    })
+    expect(summarizeExecError(err)).toBe("Set-ScheduledTask : Access is denied.")
+    const noStderr = Object.assign(new Error(`Command failed: x -EncodedCommand ${"QQBB".repeat(500)}`), { status: 3, stderr: Buffer.from("") })
+    expect(summarizeExecError(noStderr)).toBe("exit code 3")
+    expect(summarizeExecError(new Error("spawnSync C:\\x\\powershell.exe ENOENT"))).toBe("spawnSync C:\\x\\powershell.exe ENOENT")
+    expect(summarizeExecError(Object.assign(new Error("x"), { stderr: "e".repeat(5000) })).length).toBeLessThanOrEqual(1000)
   })
 })
 
@@ -105,7 +150,14 @@ describe("task configure script", () => {
     expect(script).toContain("$settings.DisallowStartIfOnBatteries = $false")
     expect(script).toContain("$settings.StopIfGoingOnBatteries = $false")
     expect(script).toContain("$settings.StartWhenAvailable = $true")
+    expect(script).toContain("$settings.ExecutionTimeLimit = 'PT0S'")
     expect(script).toContain("Set-ScheduledTask -TaskPath '\\OpenCode\\' -TaskName $name -Action $action -Settings $settings | Out-Null")
+  })
+
+  test("psQuote doubles typographic single quotes too", () => {
+    const action = buildWindowsSupervisorAction("C:\\Users\\a\u2018b\u2019c\u201Ad\u201Be\\s.ps1", "C:\\j.json")
+    const script = buildWindowsTaskConfigureScript(["\\OpenCode\\x"], action)
+    expect(script).toContain("a\u2018\u2018b\u2019\u2019c\u201A\u201Ad\u201B\u201Be")
   })
 
   test("rejects tasks in different folders", () => {
@@ -165,6 +217,10 @@ describe("supervisor.ps1 template", () => {
       "=== Scheduled run skipped (already running pid=$lockPid)",
       "=== Finished $finishedAt status=$finalStatus exitCode=$exitCode durationMs=$durationMs ===",
       "=== Timeout after $timeout seconds",
+      "ConvertTo-Json -InputObject $perm -Depth 20 -Compress",
+      "[System.IO.FileMode]::CreateNew",
+      "procStart",
+      "$proc.HasExited",
       "logs\\scheduler\\$scopeId",
       "scheduler\\scopes\\$scopeId",
       "'lastRunAt'",
@@ -189,12 +245,31 @@ describe("supervisor.ps1 template", () => {
   })
 
   test("avoids PowerShell pitfalls: no automatic-variable assignment, no '$var:' in strings", () => {
-    for (const reserved of ["$home", "$pid", "$args", "$error", "$input", "$matches", "$host"]) {
+    for (const reserved of ["$home", "$pid", "$args", "$error", "$input", "$matches", "$host", "$true", "$false", "$null", "$_"]) {
       expect(WINDOWS_SUPERVISOR_SCRIPT.toLowerCase()).not.toMatch(new RegExp(`\\${reserved} *=[^=]`))
     }
     expect(WINDOWS_SUPERVISOR_SCRIPT).not.toMatch(/"[^"\n]*\$[A-Za-z_]+:[^"\n]*"/)
+    // PowerShell variable names are case-insensitive: two spellings would be one variable
+    // ($Inv vs $inv clobbered the culture object and broke every timestamp after it).
+    const spellings = new Map<string, Set<string>>()
+    for (const match of WINDOWS_SUPERVISOR_SCRIPT.matchAll(/\$([A-Za-z_][A-Za-z0-9_]*)/g)) {
+      const key = match[1].toLowerCase()
+      if (!spellings.has(key)) spellings.set(key, new Set())
+      spellings.get(key)!.add(match[1])
+    }
+    const clashes = [...spellings.values()].filter((set) => set.size > 1).map((set) => [...set].join("/"))
+    expect(clashes).toEqual([])
     const opens = (WINDOWS_SUPERVISOR_SCRIPT.match(/[{(]/g) ?? []).length
     const closes = (WINDOWS_SUPERVISOR_SCRIPT.match(/[})]/g) ?? []).length
     expect(opens).toBe(closes)
+  })
+
+  test("trap body cannot throw: guarded and uses a timestamp that needs no script variables", () => {
+    const trap = WINDOWS_SUPERVISOR_SCRIPT.slice(WINDOWS_SUPERVISOR_SCRIPT.indexOf("trap {"))
+    const body = trap.slice(0, trap.indexOf("\n}\n") + 3)
+    expect(body).toContain("$trapRecord = $_")
+    expect(body).not.toContain("Get-IsoNow")
+    expect(body).toContain("try {")
+    expect(body).toContain("exit 1")
   })
 })

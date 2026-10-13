@@ -22,13 +22,13 @@ try { if (Get-TypeData -TypeName System.Array) { Remove-TypeData -TypeName Syste
 
 $LF = [string][char]10
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
-$Inv = [System.Globalization.CultureInfo]::InvariantCulture
+$InvariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
 $log = $null
 $lockPath = $null
 
 function Get-IsoNow {
   # Same shape as supervisor.pl's strftime("%Y-%m-%dT%H:%M:%S%z").
-  $s = [DateTime]::Now.ToString("yyyy-MM-dd'T'HH:mm:sszzz", $Inv)
+  $s = [DateTime]::Now.ToString("yyyy-MM-dd'T'HH:mm:sszzz", $InvariantCulture)
   return ($s -replace ':(\d\d)$', '$1')
 }
 
@@ -63,9 +63,48 @@ function Write-Log([string]$Text) {
   if ($log) { $log.Write($Text) }
 }
 
-function Test-PidAlive($ProcessId) {
-  if (-not $ProcessId) { return $false }
-  return [bool](Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+function Get-ProcStart($ProcessId) {
+  try { return (Get-Process -Id $ProcessId -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o', $InvariantCulture) } catch { return $null }
+}
+
+# Lock owner still running? Compares the process start time too, so a reused PID is not mistaken for the owner.
+function Test-LockOwnerAlive($LockData) {
+  if (-not $LockData -or -not $LockData.pid) { return $false }
+  $ownerStart = Get-ProcStart ([int]$LockData.pid)
+  if (-not $ownerStart) { return $false }
+  if (-not $LockData.procStart) { return $true }
+  try {
+    $delta = [DateTime]::Parse($ownerStart, $InvariantCulture).ToUniversalTime() - [DateTime]::Parse([string]$LockData.procStart, $InvariantCulture).ToUniversalTime()
+    return ([Math]::Abs($delta.TotalSeconds) -lt 2)
+  } catch { return $true }
+}
+
+# Create the lock atomically (fails if another run created it first).
+function New-LockFile([string]$Path, $Data) {
+  try {
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+  } catch {
+    return $false
+  }
+  try {
+    $bytes = $Utf8.GetBytes((ConvertTo-Json -InputObject $Data -Depth 5))
+    $stream.Write($bytes, 0, $bytes.Length)
+  } finally {
+    $stream.Dispose()
+  }
+  return $true
+}
+
+function Stop-ProcessTree($ProcessId) {
+  try {
+    $kill = New-Object System.Diagnostics.ProcessStartInfo
+    $kill.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    $kill.Arguments = '/PID ' + $ProcessId + ' /T /F'
+    $kill.UseShellExecute = $false
+    $kill.CreateNoWindow = $true
+    $killer = [System.Diagnostics.Process]::Start($kill)
+    [void]$killer.WaitForExit(15000)
+  } catch {}
 }
 
 # Quote one argument for CreateProcess / CommandLineToArgvW (MSVCRT rules).
@@ -86,10 +125,18 @@ function ConvertTo-WinArg([string]$Value) {
   return $sb.ToString()
 }
 
+# Must never throw itself: no script helpers or culture variables, every step guarded.
 trap {
-  Write-Log ($LF + '=== Supervisor error ' + (Get-IsoNow) + ': ' + $_.Exception.Message + ' ===' + $LF)
-  if ($lockPath) { Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue }
-  if ($log) { $log.Dispose() }
+  $trapRecord = $_
+  try {
+    $trapMessage = 'unknown error'
+    try { $trapMessage = [string]$trapRecord.Exception.Message } catch {}
+    $trapStamp = ''
+    try { $trapStamp = [DateTime]::Now.ToString('o') } catch {}
+    if ($log) { $log.Write([string][char]10 + '=== Supervisor error ' + $trapStamp + ': ' + $trapMessage + ' ===' + [string][char]10) }
+  } catch {}
+  try { if ($lockPath) { Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue } } catch {}
+  try { if ($log) { $log.Dispose() } } catch {}
   exit 1
 }
 
@@ -119,8 +166,9 @@ $log.AutoFlush = $true
 $candidateLock = Join-Path $locksDir "$slug.json"
 if (Test-Path -LiteralPath $candidateLock) {
   $lockPid = 0
+  $lock = $null
   try { $lock = Read-JsonFile $candidateLock; if ($lock.pid) { $lockPid = [int]$lock.pid } } catch {}
-  if (Test-PidAlive $lockPid) {
+  if (Test-LockOwnerAlive $lock) {
     Write-Log ($LF + "=== Scheduled run skipped (already running pid=$lockPid) " + (Get-IsoNow) + ' ===' + $LF)
     $log.Dispose()
     exit 0
@@ -129,12 +177,18 @@ if (Test-Path -LiteralPath $candidateLock) {
 }
 
 $random = New-Object System.Random
-$runId = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0).ToString($Inv) + '-' + $random.Next(0, 1000000000).ToString('000000000', $Inv)
+$runId = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0).ToString($InvariantCulture) + '-' + $random.Next(0, 1000000000).ToString('000000000', $InvariantCulture)
 $startedAt = Get-IsoNow
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
+if (-not (New-LockFile $candidateLock ([ordered]@{ pid = $PID; procStart = (Get-ProcStart $PID); runId = $runId; startedAt = $startedAt }))) {
+  # Another run created the lock between the check above and now.
+  Write-Log ($LF + '=== Scheduled run skipped (already running) ' + (Get-IsoNow) + ' ===' + $LF)
+  $log.Dispose()
+  exit 0
+}
+# Only now is the lock ours to delete.
 $lockPath = $candidateLock
-Write-JsonAtomic $lockPath ([ordered]@{ pid = $PID; runId = $runId; startedAt = $startedAt })
 
 # Update job metadata: running
 Set-Prop $job 'lastRunAt' $startedAt
@@ -157,8 +211,8 @@ $perm['question'] = 'deny'
 
 Write-Log ($LF + "=== Scheduled run $startedAt runId=$runId ===" + $LF)
 
-$inv = $job.invocation
-if (-not $inv -or -not $inv.command -or -not ($inv.args -is [array])) {
+$invocation = $job.invocation
+if (-not $invocation -or -not $invocation.command -or -not ($invocation.args -is [array])) {
   Write-Log ($LF + '=== Supervisor error ' + (Get-IsoNow) + ': job missing invocation.command/args ===' + $LF)
   $now = Get-IsoNow
   Set-Prop $job 'lastRunStatus' 'failed'
@@ -177,8 +231,8 @@ $timeout = $null
 if ($null -ne $job.timeoutSeconds -and ([string]$job.timeoutSeconds) -match '^\d+$') { $timeout = [int64]$job.timeoutSeconds }
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = [string]$inv.command
-$psi.Arguments = (@($inv.args | ForEach-Object { ConvertTo-WinArg ([string]$_) }) -join ' ')
+$psi.FileName = [string]$invocation.command
+$psi.Arguments = (@($invocation.args | ForEach-Object { ConvertTo-WinArg ([string]$_) }) -join ' ')
 $psi.WorkingDirectory = $workdir
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
@@ -188,7 +242,7 @@ $psi.RedirectStandardError = $true
 $psi.StandardOutputEncoding = $Utf8
 $psi.StandardErrorEncoding = $Utf8
 $psi.EnvironmentVariables['PWD'] = $workdir
-$psi.EnvironmentVariables['OPENCODE_PERMISSION'] = (ConvertTo-Json -InputObject $perm -Compress)
+$psi.EnvironmentVariables['OPENCODE_PERMISSION'] = (ConvertTo-Json -InputObject $perm -Depth 20 -Compress)
 $psi.EnvironmentVariables['OPENCODE_SCHEDULER_RUN_ID'] = $runId
 
 $timedOut = $false
@@ -216,6 +270,7 @@ if ($proc) {
   $deadline = $null
   if ($timeout -gt 0) { $deadline = [DateTime]::UtcNow.AddSeconds($timeout) }
   $killedAt = $null
+  $exitedAt = $null
   while ($outTask -or $errTask) {
     $pending = @()
     if ($outTask) { $pending += $outTask }
@@ -234,20 +289,19 @@ if ($proc) {
     if ($deadline -and -not $timedOut -and [DateTime]::UtcNow -gt $deadline) {
       $timedOut = $true
       $killedAt = [DateTime]::UtcNow
-      Write-Log ($LF + "=== Timeout after $timeout seconds " + (Get-IsoNow) + '; killing process tree ===' + $LF)
-      try {
-        $kill = New-Object System.Diagnostics.ProcessStartInfo
-        $kill.FileName = 'taskkill.exe'
-        $kill.Arguments = '/PID ' + $childPid + ' /T /F'
-        $kill.UseShellExecute = $false
-        $kill.CreateNoWindow = $true
-        $killer = [System.Diagnostics.Process]::Start($kill)
-        [void]$killer.WaitForExit(15000)
-      } catch {}
+      Write-Log ($LF + "=== Timeout after $timeout seconds " + (Get-IsoNow) + '; killing process tree (taskkill /T /F) ===' + $LF)
+      Stop-ProcessTree $childPid
       try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
     }
     # A grandchild that survived the kill could keep the pipes open: stop reading after a grace period.
     if ($killedAt -and ([DateTime]::UtcNow - $killedAt).TotalSeconds -gt 10) { break }
+    # opencode exited but a descendant (MCP server, LSP, git) still holds the inherited pipes:
+    # drain briefly, then stop instead of waiting forever with the lock held.
+    if (-not $exitedAt -and $proc.HasExited) { $exitedAt = [DateTime]::UtcNow }
+    if ($exitedAt -and ([DateTime]::UtcNow - $exitedAt).TotalSeconds -gt 3) {
+      Write-Log ($LF + '=== Child exited; a descendant still holds its output, stopping log capture ' + (Get-IsoNow) + ' ===' + $LF)
+      break
+    }
   }
   [void]$proc.WaitForExit(10000)
   if ($proc.HasExited) { $exitCode = $proc.ExitCode }
