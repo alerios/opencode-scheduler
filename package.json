@@ -6,9 +6,12 @@
   "types": "dist/plugin.d.ts",
   "type": "module",
   "files": [
-    "dist"
+    "dist",
+    "src",
+    "server.ts"
   ],
   "exports": {
+    "./server": "./server.ts",
     ".": {
       "types": "./dist/plugin.d.ts",
       "import": "./dist/plugin.js"
