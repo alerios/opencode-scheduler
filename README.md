@@ -18,6 +18,14 @@ Add to your OpenCode config (`~/.config/opencode/opencode.json` or `.opencode/op
 { "plugins": ["opencode-scheduler"] }
 ```
 
+Install straight from GitHub (no npm publish required):
+
+```json
+{ "plugins": ["github:alerios/opencode-scheduler"] }
+```
+
+or `opencode plugin add github:alerios/opencode-scheduler`. The plugin loads from source (`server.ts`); there is no build step on install.
+
 For a local checkout, use the directory path instead: `{ "plugins": ["/path/to/opencode-scheduler"] }`.
 
 ### Changes from v1
