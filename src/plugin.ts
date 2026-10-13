@@ -1,13 +1,18 @@
 import { Plugin, Skill } from "@opencode/plugin"
-import { buildTools, builtinSkillsForRegistration, setDefaultWorkdir } from "./index"
+import { buildTools, builtinSkillsForRegistration, ensureSupervisorScript } from "./index"
 import { toInputSchema } from "./v2-tool"
 
 export default Plugin.define({
   id: "opencode-scheduler",
   async setup(ctx) {
-    setDefaultWorkdir(String(ctx.location.directory))
+    // v2 plugins run inside the OpenCode service (its cwd is not the project), and one
+    // process can host several projects with this module cached: capture the directory per instance.
+    const tools = buildTools(String(ctx.location.directory))
 
-    const tools = buildTools()
+    // Keep the on-disk supervisor in sync with this plugin version (best effort).
+    try {
+      ensureSupervisorScript()
+    } catch {}
     await ctx.tool.transform((editor) => {
       for (const [name, spec] of Object.entries(tools)) {
         editor.add({
