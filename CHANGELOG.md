@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Windows (Task Scheduler) scheduled runs now go through `supervisor.ps1` (written next to `supervisor.pl`, refreshed on plugin load). It runs in the job `workdir` with `PWD` set, writes the same log, `===` markers and run records as the Perl supervisor, updates `lastRun*`, skips overlapping runs and enforces `timeoutSeconds`. The prompt stays in the job JSON instead of the task command line.
+- Windows: the opencode path is resolved to an absolute `opencode.exe` (`OPENCODE_SCHEDULER_OPENCODE_PATH`, `where.exe`, the running binary, standard install folders). If nothing is found, `schedule_job` fails with a message naming `OPENCODE_SCHEDULER_OPENCODE_PATH` instead of storing a bare `opencode` (which failed with 0x80070002).
+- Windows: tasks are set to start and keep running on battery and to start when available after a missed time. If that step fails, the tasks are removed and `schedule_job` reports the error.
 - GitHub install works on OpenCode v2.0.26: renamed the `build` script to `build:dist` so the git-dependency prepare step (which spawns an embedded npm that fails) is not triggered. Do not add `build`/`prepare`/`prepack`/`install`/`postinstall` scripts.
 - `main` and `exports["."]` now point at `server.ts` (source); removed the nonexistent `types` field and `dist` from `files`; `dist/` is gitignored.
 
