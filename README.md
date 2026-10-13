@@ -215,13 +215,13 @@ To install the built-in skill into your project (no copy/paste), open OpenCode i
 Install the scheduled job best practices skill
 ```
 
-This calls the plugin’s `install_skill` tool and writes `.opencode/skill/scheduled-job-best-practices/SKILL.md`.
+This calls the plugin’s `install_skill` tool and writes `.opencode/skills/scheduled-job-best-practices/SKILL.md`.
 
 (If you prefer, you can also say: `Get skill from opencode-scheduler and add it to my skills`.)
 
 Then add `@scheduled-job-best-practices` at the top of scheduled job prompts.
 
-(Manual option: use `get_skill` to fetch `scheduled-job-best-practices` and copy it into `.opencode/skill/scheduled-job-best-practices/SKILL.md`.)
+(Manual option: use `get_skill` to fetch `scheduled-job-best-practices` and copy it into `.opencode/skills/scheduled-job-best-practices/SKILL.md`.)
 
 ## Troubleshooting
 
