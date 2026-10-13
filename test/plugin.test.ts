@@ -23,6 +23,18 @@ function fakeContext() {
 let plugin: any
 beforeAll(async () => {
   process.env.HOME = home // module constants read homedir() at import time
+  // Fail fast, before importing the plugin (which computes config paths from
+  // homedir() at module load), if the HOME-isolation preload didn't take
+  // effect — otherwise a silently-broken preload would let src/index.ts's
+  // module-level homedir() calls resolve to the real ~/.config/opencode and
+  // write into it before the explicit isolation test below ever runs.
+  const { homedir } = await import("os")
+  if (homedir() !== home) {
+    throw new Error(
+      `HOME isolation preload did not take effect: homedir() is "${homedir()}", expected "${home}". ` +
+        `Refusing to import the plugin to avoid writing into the real home directory.`,
+    )
+  }
   plugin = (await import("../src/plugin")).default
   await plugin.setup(fakeContext())
 })
