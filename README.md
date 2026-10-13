@@ -10,15 +10,22 @@ This is an [OpenCode](https://opencode.ai) plugin that uses your OS's native sch
 
 As of `v1.2.0`, jobs are scoped by `workdir` (so different projects don't collide), and scheduled runs are supervised (no overlap + optional timeout).
 
-## Install
+## Install (OpenCode v2)
 
-Add to your `opencode.json`:
+Add to your OpenCode config (`~/.config/opencode/opencode.json` or `.opencode/opencode.json`):
 
 ```json
-{
-  "plugin": ["opencode-scheduler"]
-}
+{ "plugins": ["opencode-scheduler"] }
 ```
+
+For a local checkout, use the directory path instead: `{ "plugins": ["/path/to/opencode-scheduler"] }`.
+
+### Changes from v1
+- Requires OpenCode v2 (`@opencode/plugin` 2.x). Tool names are unchanged; tools are registered as direct tools.
+- `opencode run` flags follow v2: `attachUrl` → `--server`, `variant` → `--model model#variant`. `port`, `share` and `command` are not supported.
+- New job options: `autoApprove` (`--auto`; without it, unattended runs reject permission requests) and `standalone` (`--standalone`).
+- Jobs created under v1 keep their v1 command line until you run `migrate_jobs` (dry run first, then `confirm=true`). `list_jobs` marks them.
+- The skill is registered automatically; `install_skill` now writes to `.opencode/skills/`.
 
 ## Examples
 
@@ -208,13 +215,13 @@ To install the built-in skill into your project (no copy/paste), open OpenCode i
 Install the scheduled job best practices skill
 ```
 
-This calls the plugin’s `install_skill` tool and writes `.opencode/skill/scheduled-job-best-practices/SKILL.md`.
+This calls the plugin’s `install_skill` tool and writes `.opencode/skills/scheduled-job-best-practices/SKILL.md`.
 
 (If you prefer, you can also say: `Get skill from opencode-scheduler and add it to my skills`.)
 
 Then add `@scheduled-job-best-practices` at the top of scheduled job prompts.
 
-(Manual option: use `get_skill` to fetch `scheduled-job-best-practices` and copy it into `.opencode/skill/scheduled-job-best-practices/SKILL.md`.)
+(Manual option: use `get_skill` to fetch `scheduled-job-best-practices` and copy it into `.opencode/skills/scheduled-job-best-practices/SKILL.md`.)
 
 ## Troubleshooting
 
